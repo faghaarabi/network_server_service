@@ -1,0 +1,12 @@
+# binaries
+db_test
+ndbm_check
+
+# db files
+db/*.db
+db/*.dir
+db/*.pag
+testdb.db
+
+# mac
+.DS_Store
