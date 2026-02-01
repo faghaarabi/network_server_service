@@ -1,24 +1,14 @@
 #include "user_db.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-int main(void) {
-    user_db_t *db = user_db_open("db/users");
-    if (!db) {
-        puts("failed to open db");
-        return 1;
+static void dump(const char *username, const void *value, size_t len, void *ctx) {
+    (void)ctx;
+    printf("user=%s len=%zu ", username, len);
+    if (value && len) {
+        printf("value=");
+        fwrite(value, 1, len, stdout);
     }
-
-    if (!user_db_put(db, "alice", "display=Alice;status=active", false)) {
-        puts("insert alice failed (maybe already exists)");
-    }
-
-    char buf[256];
-    if (user_db_get(db, "alice", buf, sizeof(buf))) {
-        printf("alice => %s\n", buf);
-    } else {
-        puts("alice not found");
-    }
-
-    user_db_close(db);
-    return 0;
+    printf("\n");
 }
