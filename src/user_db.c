@@ -23,3 +23,48 @@ static udb_status_t validate_username(const char *u) {
     }
     return UDB_OK;
 }
+static datum make_key(const char *username) {
+    datum k;
+    k.dptr = (char *)username;
+    k.dsize = (int)strlen(username);
+    return k;
+}
+
+udb_status_t user_db_open(user_db_t **out, const char *path) {
+    if (!out || !path || path[0] == '\0') return UDB_ERR_INVALID;
+
+    user_db_t *db = (user_db_t *)calloc(1, sizeof(*db));
+    if (!db) return UDB_ERR_IO;
+
+    db->dbm = dbm_open(path, O_RDWR | O_CREAT, 0644);
+    if (!db->dbm) {
+        free(db);
+        return UDB_ERR_OPEN;
+    }
+
+    *out = db;
+    return UDB_OK;
+}
+udb_status_t user_db_exists(user_db_t *db, const char *username, bool *out_exists) {
+    if (!db || !db->dbm || !out_exists) return UDB_ERR_INVALID;
+
+    udb_status_t vu = validate_username(username);
+    if (vu != UDB_OK) return vu;
+
+    datum k = make_key(username);
+    datum v = dbm_fetch(db->dbm, k);
+
+    *out_exists = (v.dptr != NULL);
+    return UDB_OK;
+}
+
+
+udb_status_t user_db_close(user_db_t *db) {
+    if (!db) return UDB_ERR_INVALID;
+    if (db->dbm) {
+        dbm_close(db->dbm);
+        db->dbm = NULL;
+    }
+    free(db);
+    return UDB_OK;
+}
