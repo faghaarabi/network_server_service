@@ -61,3 +61,10 @@ extern "C" {
                                    const void *value,
                                    size_t value_len,
                                    void *ctx);
+    udb_status_t user_db_iterate(user_db_t *db, user_db_iter_cb cb, void *ctx);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
