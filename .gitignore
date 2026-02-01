@@ -10,3 +10,11 @@ testdb.db
 
 # mac
 .DS_Store
+
+# build dirs
+cmake-build-*/
+*.o
+*.a
+
+
+
