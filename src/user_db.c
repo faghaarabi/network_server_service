@@ -68,3 +68,90 @@ udb_status_t user_db_close(user_db_t *db) {
     free(db);
     return UDB_OK;
 }
+
+udb_status_t user_db_put(user_db_t *db,
+                         const char *username,
+                         const void *value,
+                         size_t value_len,
+                         bool overwrite) {
+    if (!db || !db->dbm || !value || value_len == 0) return UDB_ERR_INVALID;
+
+    udb_status_t vu = validate_username(username);
+    if (vu != UDB_OK) return vu;
+
+    datum k = make_key(username);
+
+    datum v;
+    v.dptr = (char *)value;
+    v.dsize = (int)value_len;
+
+    int flags = overwrite ? DBM_REPLACE : DBM_INSERT;
+
+    // rc: 0 success, 1 means "exists" when DBM_INSERT, -1 error
+    int rc = dbm_store(db->dbm, k, v, flags);
+
+    if (rc == 0) return UDB_OK;
+    if (rc == 1) return UDB_ERR_EXISTS;
+    return UDB_ERR_IO;
+}
+
+udb_status_t user_db_get(user_db_t *db,
+                         const char *username,
+                         void **out_value,
+                         size_t *out_len) {
+    if (!db || !db->dbm || !out_value || !out_len) return UDB_ERR_INVALID;
+
+    udb_status_t vu = validate_username(username);
+    if (vu != UDB_OK) return vu;
+
+    datum k = make_key(username);
+    datum v = dbm_fetch(db->dbm, k);
+
+    if (!v.dptr) return UDB_ERR_NOTFOUND;
+
+    void *copy = malloc((size_t)v.dsize);
+    if (!copy) return UDB_ERR_IO;
+
+    memcpy(copy, v.dptr, (size_t)v.dsize);
+    *out_value = copy;
+    *out_len = (size_t)v.dsize;
+
+    return UDB_OK;
+}
+
+udb_status_t user_db_del(user_db_t *db, const char *username) {
+    if (!db || !db->dbm) return UDB_ERR_INVALID;
+
+    udb_status_t vu = validate_username(username);
+    if (vu != UDB_OK) return vu;
+
+    datum k = make_key(username);
+
+    int rc = dbm_delete(db->dbm, k);
+    if (rc == 0) return UDB_OK;
+
+    // Some implementations return -1 if key doesn't exist
+    return UDB_ERR_NOTFOUND;
+}
+
+udb_status_t user_db_iterate(user_db_t *db, user_db_iter_cb cb, void *ctx) {
+    if (!db || !db->dbm || !cb) return UDB_ERR_INVALID;
+
+    for (datum k = dbm_firstkey(db->dbm); k.dptr != NULL; k = dbm_nextkey(db->dbm)) {
+        // Make key NUL-terminated for callback
+        char *uname = (char *)malloc((size_t)k.dsize + 1);
+        if (!uname) return UDB_ERR_IO;
+
+        memcpy(uname, k.dptr, (size_t)k.dsize);
+        uname[k.dsize] = '\0';
+
+        datum v = dbm_fetch(db->dbm, k);
+
+        cb(uname, v.dptr, (size_t)((v.dptr) ? v.dsize : 0), ctx);
+
+        free(uname);
+    }
+
+    return UDB_OK;
+}
+
