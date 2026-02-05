@@ -14,11 +14,13 @@ target_include_directories(user_db PUBLIC
 # Main server app (name must NOT be "server" because you have server/ dir)
 add_executable(server_app
         main.c
+        protocol.c
 )
 target_link_libraries(server_app PRIVATE user_db)
 
 # Optional: db_test executable
 add_executable(db_test
         src/db_test.c
+        protocol.h
 )
 target_link_libraries(db_test PRIVATE user_db)

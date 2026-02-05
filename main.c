@@ -3,6 +3,16 @@
 #include <string.h>
 
 #include "user_db.h"
+#ifndef PROTOCOL_H
+#define PROTOCOL_H
+
+#include "user_db.h"
+
+int  protocol_handle_one(int client_fd, user_db_t *db);
+void protocol_handle_client(int client_fd, user_db_t *db);
+
+#endif
+
 
 static int run_db_check(void) {
     user_db_t *db = NULL;
