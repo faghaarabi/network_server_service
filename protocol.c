@@ -32,3 +32,23 @@ enum Status {
     ST_SENDER_ERR = 1,
     ST_RECEIVER_ERR = 2
 };
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t  version;
+    uint8_t  type;
+    uint8_t  status;
+    uint8_t  padding;
+    uint32_t size_be;   // body length, big-endian
+} WireHeader;
+
+typedef struct {
+    uint8_t ip[4];
+    uint8_t server_id;
+} BodyServerReg; // also used for health check
+
+typedef struct {
+    uint8_t username16[16];
+    uint8_t password16[16];
+    uint8_t id;
+} BodyAccountReg;
