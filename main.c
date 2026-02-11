@@ -1,6 +1,6 @@
 /*
  * Demo run:
- * ./server_app --listen-ip 192.168.0.123 --listen-port 42096 \
+ * ./server_app --listen-ip 192.168.0.121 --listen-port 42096 \
  *              --mgr-ip 192.168.0.131 --mgr-port 42069 \
  *              --server-id 1 --db db/users.db
  */
@@ -20,7 +20,7 @@
 
 #include "user_db.h"
 
-/* protocol entrypoints */
+
 void protocol_handle_client(int client_fd, user_db_t *db);
 
 /* protocol basics */
@@ -52,7 +52,7 @@ typedef struct {
 } BodyServerReg;
 #pragma pack(pop)
 
-/* ---------- helpers ---------- */
+
 
 static int read_exact(int fd, void *buf, size_t n) {
     size_t off = 0;
@@ -108,7 +108,7 @@ static int listen_tcp(const char *ip, int port) {
     return fd;
 }
 
-/* ---------- manager messages ---------- */
+
 
 static void send_server_reg(int mgr_fd, uint8_t ip[4], uint8_t id) {
     WireHeader h = {
@@ -140,7 +140,6 @@ static void send_mgr_ack(int mgr_fd, uint8_t type, uint8_t *body, uint32_t blen)
     }
 }
 
-/* ---------- manager listener thread ---------- */
 
 static void *mgr_reader_thread(void *arg) {
     int mgr_fd = *(int *)arg;
@@ -171,7 +170,6 @@ static void *mgr_reader_thread(void *arg) {
             }
         }
 
-        /* manager wants a reply for type 0x08 */
         if (h.type == 0x08) {
             send_mgr_ack(mgr_fd, 0x09, body, blen);
             printf("[MANAGER] ACK sent (type=0x09)\n");
@@ -183,10 +181,9 @@ static void *mgr_reader_thread(void *arg) {
     return NULL;
 }
 
-/* ---------- main ---------- */
 
 int main() {
-    const char *MY_IP  = "192.168.0.123";
+    const char *MY_IP  = "192.168.0.121";
     const int   MY_PORT = 42096;
     const char *MGR_IP = "192.168.0.131";
     const int   MGR_PORT = 42069;
@@ -214,6 +211,5 @@ int main() {
         int c = accept(listen_fd, NULL, NULL);
         if (c < 0) continue;
         protocol_handle_client(c, db);
-        close(c);
     }
 }
