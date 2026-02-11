@@ -30,6 +30,9 @@
 #include <arpa/inet.h>   // ntohl/htonl
 
 #include "user_db.h"
+#include <netinet/in.h>
+#include <stdio.h>
+#include <arpa/inet.h>
 
 // ---- constants (match your ASN.1 / hexpat numeric values) ----
 enum { PROTO_V1 = 0x01 };
@@ -262,6 +265,8 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
             // Store password as raw 16 bytes (matches fixed-size protocol field)
             udb_status_t st = user_db_put(db, username, req.password16, 16, /*overwrite=*/false);
+            printf("[DB] storing username='%s' result=%d\n", username, (int)st);
+            fflush(stdout);
 
             uint8_t status = ST_OK;
             if (st == UDB_ERR_EXISTS || st == UDB_ERR_INVALID) status = ST_SENDER_ERR;

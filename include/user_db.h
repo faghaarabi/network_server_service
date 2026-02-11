@@ -42,6 +42,7 @@ extern "C" {
                              size_t value_len,
                              bool overwrite);
 
+
     /**
      * Fetch a user record (value bytes are malloc'ed; caller must free).
      */
