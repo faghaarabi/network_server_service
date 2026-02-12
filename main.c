@@ -3,11 +3,6 @@
  * ./server_app --listen-ip 0.0.0.0 --listen-port 42096 \
  * --mgr-ip 192.168.0.131 --mgr-port 42069 \
  * --server-id 1 --db db/users.db --reg-ip 192.168.0.121
- *
- * Notes:
- * - Handles networking/flow: connect to manager, listen for clients.
- * - Spawns a thread per client to prevent blocking.
- * - Removed "WELCOME" message to fix binary protocol mismatch.
  */
 
 #include <stdio.h>
@@ -33,12 +28,6 @@ enum { PROTO_V1 = 0x01 };
 enum MsgType {
     MSG_SERVER_REG_REQ = 0x00,
     MSG_SERVER_REG_RES = 0x01
-};
-
-enum Status {
-    ST_OK = 0,
-    ST_SENDER_ERR = 1,
-    ST_RECEIVER_ERR = 2
 };
 
 #pragma pack(push, 1)
@@ -128,7 +117,6 @@ static int listen_tcp(const char *ip, int port) {
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
 
-    /* Listen on all interfaces if ip is NULL or "0.0.0.0" */
     if (ip == NULL || strcmp(ip, "0.0.0.0") == 0) {
         sa.sin_addr.s_addr = htonl(INADDR_ANY);
     } else {
@@ -156,7 +144,7 @@ static void send_server_reg(int mgr_fd, uint8_t ip[4], uint8_t id) {
     WireHeader h;
     h.version = PROTO_V1;
     h.type = MSG_SERVER_REG_REQ;
-    h.status = 0;
+    h.status = 0; /* Always 0 */
     h.padding = 0;
     h.size_be = htonl((uint32_t)sizeof(BodyServerReg));
 
@@ -172,7 +160,7 @@ static void send_mgr_ack(int mgr_fd, uint8_t type, uint8_t *body, uint32_t blen)
     WireHeader h;
     h.version = PROTO_V1;
     h.type = type;
-    h.status = ST_OK;
+    h.status = 0; /* Always 0 */
     h.padding = 0;
     h.size_be = htonl(blen);
 
@@ -242,13 +230,11 @@ static int get_int_arg(int argc, char **argv, const char *key, int def) {
 static void *client_worker(void *arg) {
     client_thread_args_t *args = (client_thread_args_t *)arg;
     protocol_handle_client(args->client_fd, args->db);
-    // protocol_handle_client handles closing the fd
     free(args);
     return NULL;
 }
 
 int main(int argc, char **argv) {
-    // Force immediate output flushing for clearer logs
     setvbuf(stdout, NULL, _IONBF, 0);
 
     const char *LISTEN_IP = get_arg(argc, argv, "--listen-ip");
@@ -280,7 +266,6 @@ int main(int argc, char **argv) {
     }
     printf("Connected to manager %s:%d\n", MGR_IP, MGR_PORT);
 
-    /* Register the reachable IP with the manager (NOT 0.0.0.0). */
     uint8_t reg_ip[4] = {0};
     const char *REG_IP = get_arg(argc, argv, "--reg-ip");
     if (!REG_IP) {
@@ -324,12 +309,6 @@ int main(int argc, char **argv) {
         inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
         printf("[CLIENT] accepted %s:%u (fd=%d)\n", peer_ip, ntohs(peer.sin_port), c);
 
-        /* * FIX: Do NOT send "WELCOME" string. 
-         * The protocol is strictly binary (header first). 
-         * Sending text here causes immediate disconnects.
-         */
-
-        // Allocate thread args
         client_thread_args_t *args = malloc(sizeof(client_thread_args_t));
         if (!args) {
             perror("malloc");
