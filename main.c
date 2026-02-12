@@ -1,8 +1,13 @@
 /*
- * DEBUG VERSION
- * - Prints exact OS binding (IP:Port) to confirm LISTEN status.
- * - Logs entry/exit of accept loop.
- * - Force flushes stdout to ensure logs aren't hidden in buffers.
+ * Demo run:
+ * ./server_app --listen-ip 0.0.0.0 --listen-port 42096 \
+ * --mgr-ip 192.168.0.131 --mgr-port 42069 \
+ * --server-id 1 --db db/users.db --reg-ip 192.168.0.121
+ *
+ * Notes:
+ * - Handles networking/flow: connect to manager, listen for clients.
+ * - Spawns a thread per client to prevent blocking.
+ * - Removed "WELCOME" message to fix binary protocol mismatch.
  */
 
 #include <stdio.h>
@@ -18,7 +23,6 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
-// Assuming user_db.h is in your include path
 #include "user_db.h"
 
 void protocol_handle_client(int client_fd, user_db_t *db);
@@ -52,21 +56,11 @@ typedef struct {
 } BodyServerReg;
 #pragma pack(pop)
 
-// --- Helper: Print exactly what the Kernel thinks the socket is doing ---
-static void debug_socket(const char *label, int fd) {
-    struct sockaddr_in sin;
-    socklen_t len = sizeof(sin);
-    if (getsockname(fd, (struct sockaddr *)&sin, &len) == 0) {
-        char buf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &sin.sin_addr, buf, sizeof(buf));
-        printf("[DEBUG] %s: Socket %d is bound to %s:%d\n", 
-               label, fd, buf, ntohs(sin.sin_port));
-    } else {
-        perror("[DEBUG] getsockname failed");
-    }
-    fflush(stdout);
-}
-// -----------------------------------------------------------------------
+/* Thread arguments wrapper */
+typedef struct {
+    int client_fd;
+    user_db_t *db;
+} client_thread_args_t;
 
 static int read_exact(int fd, void *buf, size_t n) {
     size_t off = 0;
@@ -244,8 +238,17 @@ static int get_int_arg(int argc, char **argv, const char *key, int def) {
     return v ? atoi(v) : def;
 }
 
+/* Worker thread for client handling */
+static void *client_worker(void *arg) {
+    client_thread_args_t *args = (client_thread_args_t *)arg;
+    protocol_handle_client(args->client_fd, args->db);
+    // protocol_handle_client handles closing the fd
+    free(args);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
-    // Force immediate output flushing
+    // Force immediate output flushing for clearer logs
     setvbuf(stdout, NULL, _IONBF, 0);
 
     const char *LISTEN_IP = get_arg(argc, argv, "--listen-ip");
@@ -257,6 +260,8 @@ int main(int argc, char **argv) {
     int MGR_PORT = get_int_arg(argc, argv, "--mgr-port", 42069);
 
     int server_id_int = get_int_arg(argc, argv, "--server-id", 1);
+    if (server_id_int < 0) server_id_int = 1;
+    if (server_id_int > 255) server_id_int = 255;
     uint8_t server_id = (uint8_t)server_id_int;
 
     const char *DB_PATH = get_arg(argc, argv, "--db");
@@ -275,25 +280,25 @@ int main(int argc, char **argv) {
     }
     printf("Connected to manager %s:%d\n", MGR_IP, MGR_PORT);
 
-    /* Register the reachable IP with the manager */
+    /* Register the reachable IP with the manager (NOT 0.0.0.0). */
     uint8_t reg_ip[4] = {0};
     const char *REG_IP = get_arg(argc, argv, "--reg-ip");
     if (!REG_IP) {
         REG_IP = (strcmp(LISTEN_IP, "0.0.0.0") == 0) ? "127.0.0.1" : LISTEN_IP;
     }
     if (inet_pton(AF_INET, REG_IP, reg_ip) != 1) {
-        fprintf(stderr, "Bad --reg-ip: %s\n", REG_IP);
+        fprintf(stderr, "Bad --reg-ip / listen-ip for registration: %s\n", REG_IP);
         return 1;
     }
 
     send_server_reg(mgr_fd, reg_ip, server_id);
-    printf("Sent SERVER_REG_REQ (reg_ip=%s id=%u)\n", REG_IP, server_id);
+    printf("Sent SERVER_REG_REQ to manager (reg_ip=%s id=%u)\n", REG_IP, server_id);
 
-    pthread_t tid;
-    if (pthread_create(&tid, NULL, mgr_reader_thread, &mgr_fd) == 0) {
-        pthread_detach(tid);
+    pthread_t mgr_tid;
+    if (pthread_create(&mgr_tid, NULL, mgr_reader_thread, &mgr_fd) == 0) {
+        pthread_detach(mgr_tid);
     } else {
-        perror("pthread_create");
+        perror("pthread_create (manager)");
     }
 
     int listen_fd = listen_tcp(LISTEN_IP, LISTEN_PORT);
@@ -301,38 +306,47 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to listen on %s:%d\n", LISTEN_IP, LISTEN_PORT);
         return 1;
     }
-
-    // --- DEBUG: Confirm Kernel Binding ---
-    debug_socket("LISTENER_CHECK", listen_fd);
-    // -------------------------------------
-
     printf("Listening for clients on %s:%d\n", LISTEN_IP, LISTEN_PORT);
 
-    /* Accept loop */
+    /* Accept loop (Multi-threaded) */
     for (;;) {
-        printf("[SERVER] Ready. Waiting in accept() for new client...\n");
+        printf("[SERVER] waiting in accept()...\n");
 
         struct sockaddr_in peer;
         socklen_t peerlen = sizeof(peer);
         int c = accept(listen_fd, (struct sockaddr*)&peer, &peerlen);
-        
         if (c < 0) {
-            perror("accept failed");
+            perror("accept");
             continue;
         }
 
         char peer_ip[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
-        printf("[CLIENT] >>> Connection ACCEPTED from %s:%u (fd=%d)\n", peer_ip, ntohs(peer.sin_port), c);
-        
-        const char *msg = "WELCOME\n";
-        write(c, msg, strlen(msg));
+        printf("[CLIENT] accepted %s:%u (fd=%d)\n", peer_ip, ntohs(peer.sin_port), c);
 
-        // This blocks the main thread! 
-        // If a client connects and does nothing, NO ONE ELSE CAN CONNECT.
-        protocol_handle_client(c, db);
+        /* * FIX: Do NOT send "WELCOME" string. 
+         * The protocol is strictly binary (header first). 
+         * Sending text here causes immediate disconnects.
+         */
 
-        printf("[CLIENT] <<< Connection CLOSED (fd=%d)\n", c);
+        // Allocate thread args
+        client_thread_args_t *args = malloc(sizeof(client_thread_args_t));
+        if (!args) {
+            perror("malloc");
+            close(c);
+            continue;
+        }
+        args->client_fd = c;
+        args->db = db;
+
+        pthread_t client_tid;
+        if (pthread_create(&client_tid, NULL, client_worker, args) == 0) {
+            pthread_detach(client_tid);
+        } else {
+            perror("pthread_create (client)");
+            free(args);
+            close(c);
+        }
     }
 
     return 0;
