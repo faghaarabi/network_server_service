@@ -1,57 +1,26 @@
-/*
- *I added the protocol skeleton that maps the ASN.1 spec to packed C structs
- *and enums. This defines the exact on-wire layout for headers and request bodies,
- *so we can safely read/write messages without padding or endian issues. It doesn’t handle
- *logic yet — it just sets up the foundation for parsing messages and wiring them into the
- *server and DB layer
- *the protocol is its own layer. main.c handles sockets and flow control,
- *while the protocol file handles how
- *messages are encoded and decoded. Separating them keeps things cleaner and easier to extend.
- */
-
-
-/*
-./server_app \
-  --listen-ip 192.168.0.123 \
-  --listen-port 5001 \
-  --mgr-ip 192.168.0.131 \
-  --mgr-port 42069 \
-  --server-id 0 \
-  --db db/users.db
-
- */
-
-
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <arpa/inet.h>   // ntohl/htonl
+#include <arpa/inet.h>
+#include <stdio.h>
 
 #include "user_db.h"
-#include <netinet/in.h>
-#include <stdio.h>
-#include <arpa/inet.h>
 
-// ---- constants (match your ASN.1 / hexpat numeric values) ----
 enum { PROTO_V1 = 0x01 };
 
 enum MsgType {
-    MSG_SERVER_REG_REQ   = 0x00,
-    MSG_SERVER_REG_RES   = 0x01,
-
-    MSG_HEALTH_REQ       = 0x04,
-    MSG_HEALTH_RES       = 0x05,
-
-    MSG_ACCT_REG_REQ     = 0x10,
-    MSG_ACCT_REG_RES     = 0x11,
-
-    MSG_LOGIN_LOGOUT_REQ = 0x14,
-    MSG_LOGIN_LOGOUT_RES = 0x15,
-
-    MSG_LOG_REQ          = 0x18,
-    MSG_LOG_RES          = 0x19
+    MSG_SERVER_REG_REQ   = 0x00, // 00000 00 0
+    MSG_SERVER_REG_RES   = 0x01, // 00000 00 1
+    MSG_HEALTH_REQ       = 0x08, // 00001 00 0
+    MSG_HEALTH_RES       = 0x09, // 00001 00 1
+    MSG_ACCT_REG_REQ     = 0x10, // 00010 00 0
+    MSG_ACCT_REG_RES     = 0x11, // 00010 00 1
+    MSG_LOGIN_LOGOUT_REQ = 0x14, // 00010 10 0
+    MSG_LOGIN_LOGOUT_RES = 0x15, // 00010 10 1 (Implied)
+    MSG_LOG_REQ          = 0x18, // 00011 00 0
+    MSG_LOG_RES          = 0x19  // 00011 00 1 (Implied)
 };
 
 enum Status {
@@ -60,90 +29,52 @@ enum Status {
     ST_RECEIVER_ERR = 2
 };
 
-/* ---- compatibility: "BigHeader" bitfield message type used by example client ----
- * type byte layout: [res:5 bits][crud:2 bits][ack:1 bit]
- *   res  = (type >> 3) & 0x1F
- *   crud = (type >> 1) & 0x03
- *   ack  =  type       & 0x01   (0=request, 1=response; client treats 1 as ACK)
- */
-enum {
-    RES_SERVER     = 0x00,
-    RES_ACTIVATION = 0x01,
-    RES_ACCOUNT    = 0x02,
-    RES_LOG        = 0x03
-};
-
-enum {
-    CRUD_CREATE = 0x00,
-    CRUD_READ   = 0x01,
-    CRUD_UPDATE = 0x02,
-    CRUD_DELETE = 0x03
-};
-
-static inline uint8_t type_res(uint8_t t)  { return (uint8_t)((t >> 3) & 0x1F); }
-static inline uint8_t type_crud(uint8_t t) { return (uint8_t)((t >> 1) & 0x03); }
-static inline uint8_t type_ack(uint8_t t)  { return (uint8_t)(t & 0x01); }
-
-static inline uint8_t make_type(uint8_t res, uint8_t crud, uint8_t ack) {
-    return (uint8_t)(((res & 0x1F) << 3) | ((crud & 0x03) << 1) | (ack & 0x01));
-}
-
-
 #pragma pack(push, 1)
 typedef struct {
     uint8_t  version;
     uint8_t  type;
     uint8_t  status;
     uint8_t  padding;
-    uint32_t size_be;   // body length, big-endian
+    uint32_t size_be;
 } WireHeader;
 
-#pragma pack(push, 1)
-// ...
-typedef struct {
-    uint8_t account_id;
-} BodyAccountRegRes;
-#pragma pack(pop)
-
-
+// Server Register: 4 byte IP + 1 byte ID
 typedef struct {
     uint8_t ip[4];
     uint8_t server_id;
-} BodyServerReg; // also used for health check
+} BodyServerReg;
 
+// Create Account: 16 user + 16 pass + 1 id + 1 status = 34 bytes
 typedef struct {
     uint8_t username16[16];
     uint8_t password16[16];
-    uint8_t id;
+    uint8_t client_id;
+    uint8_t status;    
 } BodyAccountReg;
 
-/* Example client sends 34-byte account body:
- * username16 + password16 + server_id + status_flag
- * status_flag: 1=online/login, 0=offline/logout (client uses CRUD_UPDATE for this)
- */
+// Login/Logout: 16 user + 16 pass + 1 id + 1 status = 34 bytes
 typedef struct {
     uint8_t username16[16];
     uint8_t password16[16];
-    uint8_t server_id;
-    uint8_t status_flag;
-} BodyAccount34;
-
-// commited
-typedef struct {
-    uint8_t password16[16];
-    uint8_t account_id;
-    uint8_t account_status;
-    uint8_t ip[4];
+    uint8_t client_id;
+    uint8_t status;     // 1=Login (0x01), 0=Logout (0x00)
 } BodyLoginLogout;
+
+// Forward Logs: 1 byte ID + 2 byte len + data
+typedef struct {
+    uint8_t server_id;
+    uint16_t log_len_be;
+    // Log data follows immediately
+} BodyLogHeader;
 #pragma pack(pop)
 
-//small IO helpers
+// --- Helpers ---
 static int read_exact(int fd, void *buf, size_t n) {
     uint8_t *p = (uint8_t*)buf;
     size_t off = 0;
     while (off < n) {
         ssize_t r = read(fd, p + off, n - off);
-        if (r == 0) return 0;               // peer closed
+        if (r == 0) return 0;
         if (r < 0) {
             if (errno == EINTR) continue;
             return -1;
@@ -183,32 +114,30 @@ static int send_response(int fd, uint8_t type, uint8_t status,
     return 0;
 }
 
-// Make 16-byte fixed fields safe to use as C strings (adds '\0').
 static void to_cstr_16(const uint8_t in[16], char out[17]) {
     memcpy(out, in, 16);
     out[16] = '\0';
 }
 
-// public API: handle one message
-// return: 1 keep going, 0 client closed, -1 fatal read/write error
+// --- Main Protocol Handler ---
 int protocol_handle_one(int client_fd, user_db_t *db) {
     WireHeader h;
 
+    // 1. Read Header
     int rr = read_exact(client_fd, &h, sizeof(h));
-    if (rr == 0) return 0;
-    if (rr < 0) return -1;
+    if (rr == 0) return 0; // EOF
+    if (rr < 0) return -1; // Error
 
     if (h.version != PROTO_V1) {
-        // wrong version -> sender error, empty body
-        (void)send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
-        return 1;
+        send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
+        return 1; // Close connection on bad version
     }
 
     uint32_t body_len = ntohl(h.size_be);
-
-    // simple safety cap: avoid huge alloc (adjust if your spec needs bigger)
-    if (body_len > 4096) {
-        (void)send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
+    
+    // Safety check for huge payloads
+    if (body_len > 65536 + 100) { 
+        send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
         return 1;
     }
 
@@ -216,7 +145,7 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
     if (body_len > 0) {
         body = (uint8_t*)malloc(body_len);
         if (!body) {
-            (void)send_response(client_fd, h.type, ST_RECEIVER_ERR, NULL, 0);
+            send_response(client_fd, h.type, ST_RECEIVER_ERR, NULL, 0);
             return 1;
         }
         if (read_exact(client_fd, body, body_len) <= 0) {
@@ -225,36 +154,28 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
         }
     }
 
+    // 2. Dispatch
     switch (h.type) {
 
-        case MSG_SERVER_REG_REQ: {
+        case MSG_SERVER_REG_REQ: { // 0x00
+            // Server usually initiates this, but if we receive it, just ACK.
             if (body_len != sizeof(BodyServerReg)) {
-                (void)send_response(client_fd, MSG_SERVER_REG_RES, ST_SENDER_ERR, NULL, 0);
-                break;
+                send_response(client_fd, MSG_SERVER_REG_RES, ST_SENDER_ERR, NULL, 0);
+            } else {
+                send_response(client_fd, MSG_SERVER_REG_RES, ST_OK, body, body_len);
             }
-            BodyServerReg req;
-            memcpy(&req, body, sizeof(req));
-
-            (void)send_response(client_fd, MSG_SERVER_REG_RES, ST_OK, &req, sizeof(req));
             break;
         }
 
-        case MSG_HEALTH_REQ: {
-            if (body_len != sizeof(BodyServerReg)) {
-                (void)send_response(client_fd, MSG_HEALTH_RES, ST_SENDER_ERR, NULL, 0);
-                break;
-            }
-            BodyServerReg req;
-            memcpy(&req, body, sizeof(req));
-
-            // TODO: update "alive" timestamp for server_id
-            (void)send_response(client_fd, MSG_HEALTH_RES, ST_OK, &req, sizeof(req));
+        case MSG_HEALTH_REQ: { // 0x08
+            // Echo back the body (IP + ID)
+            send_response(client_fd, MSG_HEALTH_RES, ST_OK, body, body_len);
             break;
         }
 
-        case MSG_ACCT_REG_REQ: {
+        case MSG_ACCT_REG_REQ: { // 0x10
             if (body_len != sizeof(BodyAccountReg)) {
-                (void)send_response(client_fd, MSG_ACCT_REG_RES, ST_SENDER_ERR, NULL, 0);
+                send_response(client_fd, MSG_ACCT_REG_RES, ST_SENDER_ERR, NULL, 0);
                 break;
             }
             BodyAccountReg req;
@@ -263,118 +184,95 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
             char username[17];
             to_cstr_16(req.username16, username);
 
-            // Store password as raw 16 bytes (matches fixed-size protocol field)
-            udb_status_t st = user_db_put(db, username, req.password16, 16, /*overwrite=*/false);
-            printf("[DB] storing username='%s' result=%d\n", username, (int)st);
-            fflush(stdout);
+            // Try to store in DB
+            udb_status_t st = user_db_put(db, username, req.password16, 16, false);
+            printf("[DB] Create User '%s': %d\n", username, st);
 
-            uint8_t status = ST_OK;
-            if (st == UDB_ERR_EXISTS || st == UDB_ERR_INVALID) status = ST_SENDER_ERR;
-            else if (st != UDB_OK) status = ST_RECEIVER_ERR;
-
-            // If your ASN.1 requires a response body, add it later. Keep empty for now.
-            (void)send_response(client_fd, MSG_ACCT_REG_RES, status, NULL, 0);
+            if (st == UDB_OK) {
+                // Success: Spec says status 0000 0001 (which is 1)
+                req.status = 1; 
+                send_response(client_fd, MSG_ACCT_REG_RES, ST_OK, &req, sizeof(req));
+            } else if (st == UDB_ERR_EXISTS) {
+                 // Fail: send error status
+                 send_response(client_fd, MSG_ACCT_REG_RES, ST_SENDER_ERR, NULL, 0);
+            } else {
+                 send_response(client_fd, MSG_ACCT_REG_RES, ST_RECEIVER_ERR, NULL, 0);
+            }
             break;
         }
 
-        case MSG_LOGIN_LOGOUT_REQ: {
+        case MSG_LOGIN_LOGOUT_REQ: { // 0x14
             if (body_len != sizeof(BodyLoginLogout)) {
-                (void)send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_SENDER_ERR, NULL, 0);
+                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_SENDER_ERR, NULL, 0);
                 break;
             }
             BodyLoginLogout req;
             memcpy(&req, body, sizeof(req));
 
-            // TODO: implement your actual login/logout logic.
-            // Spec uses account_id; your DB currently keys by username, so you’ll need a mapping
-            // (or change key strategy). For now just ack OK.
-            (void)req;
-            (void)send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_OK, NULL, 0);
-            break;
-        }
+            char username[17];
+            to_cstr_16(req.username16, username);
 
-        case MSG_LOG_REQ: {
-            // body: serverId(1), pad(1), msgLen(2), msg(msgLen)
-            if (body_len < 4) {
-                (void)send_response(client_fd, MSG_LOG_RES, ST_SENDER_ERR, NULL, 0);
-                break;
-            }
-            uint8_t server_id = body[0];
+            // Status 1 = Login, Status 0 = Logout [cite: 9, 10]
+            if (req.status == 1) { 
+                // --- LOGIN ---
+                void *stored_pw = NULL;
+                size_t stored_len = 0;
+                udb_status_t st = user_db_get(db, username, &stored_pw, &stored_len);
 
-            // Assume big-endian length (adjust if your spec says otherwise)
-            uint16_t msg_len = (uint16_t)body[2] << 8 | (uint16_t)body[3];
-            if ((uint32_t)(4 + msg_len) != body_len) {
-                (void)send_response(client_fd, MSG_LOG_RES, ST_SENDER_ERR, NULL, 0);
-                break;
-            }
-
-            // message bytes are body+4, length msg_len (NOT null-terminated)
-            (void)server_id;
-            //
-
-            (void)send_response(client_fd, MSG_LOG_RES, ST_OK, NULL, 0);
-            break;
-        }
-
-        /* ---- example client compatibility: RES_ACCOUNT ---- */
-        default: {
-            /* If it's not one of our fixed MsgType values, it might be BigHeader-style. */
-            uint8_t res  = type_res(h.type);
-            uint8_t crud = type_crud(h.type);
-
-            if (res == RES_ACCOUNT) {
-                /* Create account */
-                if (crud == CRUD_CREATE) {
-                    if (body_len != sizeof(BodyAccount34)) {
-                        /* NACK: respond with ack=0 so client treats as SERVER_NACK */
-                        (void)send_response(client_fd, make_type(RES_ACCOUNT, CRUD_CREATE, 0), ST_SENDER_ERR, NULL, 0);
-                        break;
+                bool success = false;
+                if (st == UDB_OK) {
+                    if (stored_len == 16 && memcmp(stored_pw, req.password16, 16) == 0) {
+                        success = true;
                     }
-                    BodyAccount34 req;
-                    memcpy(&req, body, sizeof(req));
-
-                    char username[17];
-                    to_cstr_16(req.username16, username);
-
-                    udb_status_t st = user_db_put(db, username, req.password16, 16, /*overwrite=*/false);
-
-                    uint8_t status = ST_OK;
-                    if (st == UDB_ERR_EXISTS || st == UDB_ERR_INVALID) status = ST_SENDER_ERR;
-                    else if (st != UDB_OK) status = ST_RECEIVER_ERR;
-
-                    uint8_t ack_bit = (status == ST_OK) ? 1 : 0; /* client checks LSB */
-                    (void)send_response(client_fd, make_type(RES_ACCOUNT, CRUD_CREATE, ack_bit), status, NULL, 0);
-                    break;
+                    free(stored_pw);
                 }
 
-                /* Login / logout update (client uses CRUD_UPDATE and status_flag) */
-                if (crud == CRUD_UPDATE) {
-                    if (body_len != sizeof(BodyAccount34)) {
-                        (void)send_response(client_fd, make_type(RES_ACCOUNT, CRUD_UPDATE, 0), ST_SENDER_ERR, NULL, 0);
-                        break;
-                    }
-                    /* For now we ACK; DB credential verification can be added once user_db_get is available. */
-                    (void)send_response(client_fd, make_type(RES_ACCOUNT, CRUD_UPDATE, 1), ST_OK, NULL, 0);
-                    break;
+                if (success) {
+                    printf("[DB] Login Success: %s\n", username);
+                    // Echo back with status=1
+                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_OK, &req, sizeof(req));
+                } else {
+                    printf("[DB] Login Failed: %s\n", username);
+                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_SENDER_ERR, NULL, 0);
                 }
-
-                /* Unsupported CRUD on account */
-                (void)send_response(client_fd, make_type(RES_ACCOUNT, crud, 0), ST_SENDER_ERR, NULL, 0);
-                break;
+            } 
+            else {
+                // --- LOGOUT ---
+                // Spec implies status=0 for logout. Just ACK it.
+                printf("[DB] Logout: %s\n", username);
+                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, ST_OK, &req, sizeof(req));
             }
-
-            /* fall back: unknown type */
-            (void)send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
             break;
         }
 
+        case MSG_LOG_REQ: { // 0x18
+            // Spec: 1 byte ID, 2 byte Length, N byte Log
+            // We can just accept it and print it.
+            if (body_len < 3) {
+                 send_response(client_fd, MSG_LOG_RES, ST_SENDER_ERR, NULL, 0);
+                 break;
+            }
+            BodyLogHeader log_h;
+            memcpy(&log_h, body, 3); // Copy first 3 bytes
+
+            uint16_t actual_log_len = ntohs(log_h.log_len_be);
+            printf("[LOG] Received %d bytes of log data from Server ID %d\n", 
+                   actual_log_len, log_h.server_id);
+            
+            send_response(client_fd, MSG_LOG_RES, ST_OK, NULL, 0);
+            break;
+        }
+
+        default:
+            // Unknown type
+            send_response(client_fd, h.type, ST_SENDER_ERR, NULL, 0);
+            break;
     }
 
     free(body);
-    return 1;
+    return 1; // Keep connection open
 }
 
-// public API: handle a whole connection
 void protocol_handle_client(int client_fd, user_db_t *db) {
     while (1) {
         int rc = protocol_handle_one(client_fd, db);

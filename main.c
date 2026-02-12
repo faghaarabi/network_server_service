@@ -1,13 +1,8 @@
 /*
- * Demo run:
- * ./server_app --listen-ip 0.0.0.0 --listen-port 42096 \
- *              --mgr-ip 192.168.0.131 --mgr-port 42069 \
- *              --server-id 1 --db db/users.db --reg-ip 192.168.0.121
- *
- * Notes:
- * - This file handles networking/flow: connect to manager, listen for clients, accept loop.
- * - protocol_handle_client() (protocol.c) handles per-client message parsing/DB logic.
- * - Added very explicit logging around accept() so you can prove whether connections reach the server.
+ * DEBUG VERSION
+ * - Prints exact OS binding (IP:Port) to confirm LISTEN status.
+ * - Logs entry/exit of accept loop.
+ * - Force flushes stdout to ensure logs aren't hidden in buffers.
  */
 
 #include <stdio.h>
@@ -23,6 +18,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 
+// Assuming user_db.h is in your include path
 #include "user_db.h"
 
 void protocol_handle_client(int client_fd, user_db_t *db);
@@ -55,6 +51,22 @@ typedef struct {
     uint8_t server_id;
 } BodyServerReg;
 #pragma pack(pop)
+
+// --- Helper: Print exactly what the Kernel thinks the socket is doing ---
+static void debug_socket(const char *label, int fd) {
+    struct sockaddr_in sin;
+    socklen_t len = sizeof(sin);
+    if (getsockname(fd, (struct sockaddr *)&sin, &len) == 0) {
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sin.sin_addr, buf, sizeof(buf));
+        printf("[DEBUG] %s: Socket %d is bound to %s:%d\n", 
+               label, fd, buf, ntohs(sin.sin_port));
+    } else {
+        perror("[DEBUG] getsockname failed");
+    }
+    fflush(stdout);
+}
+// -----------------------------------------------------------------------
 
 static int read_exact(int fd, void *buf, size_t n) {
     size_t off = 0;
@@ -233,6 +245,9 @@ static int get_int_arg(int argc, char **argv, const char *key, int def) {
 }
 
 int main(int argc, char **argv) {
+    // Force immediate output flushing
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     const char *LISTEN_IP = get_arg(argc, argv, "--listen-ip");
     if (!LISTEN_IP) LISTEN_IP = "0.0.0.0";
     int LISTEN_PORT = get_int_arg(argc, argv, "--listen-port", 42096);
@@ -242,8 +257,6 @@ int main(int argc, char **argv) {
     int MGR_PORT = get_int_arg(argc, argv, "--mgr-port", 42069);
 
     int server_id_int = get_int_arg(argc, argv, "--server-id", 1);
-    if (server_id_int < 0) server_id_int = 1;
-    if (server_id_int > 255) server_id_int = 255;
     uint8_t server_id = (uint8_t)server_id_int;
 
     const char *DB_PATH = get_arg(argc, argv, "--db");
@@ -261,22 +274,20 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("Connected to manager %s:%d\n", MGR_IP, MGR_PORT);
-    fflush(stdout);
 
-    /* Register the reachable IP with the manager (NOT 0.0.0.0). */
+    /* Register the reachable IP with the manager */
     uint8_t reg_ip[4] = {0};
     const char *REG_IP = get_arg(argc, argv, "--reg-ip");
     if (!REG_IP) {
         REG_IP = (strcmp(LISTEN_IP, "0.0.0.0") == 0) ? "127.0.0.1" : LISTEN_IP;
     }
     if (inet_pton(AF_INET, REG_IP, reg_ip) != 1) {
-        fprintf(stderr, "Bad --reg-ip / listen-ip for registration: %s\n", REG_IP);
+        fprintf(stderr, "Bad --reg-ip: %s\n", REG_IP);
         return 1;
     }
 
     send_server_reg(mgr_fd, reg_ip, server_id);
-    printf("Sent SERVER_REG_REQ to manager (reg_ip=%s id=%u)\n", REG_IP, server_id);
-    fflush(stdout);
+    printf("Sent SERVER_REG_REQ (reg_ip=%s id=%u)\n", REG_IP, server_id);
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, mgr_reader_thread, &mgr_fd) == 0) {
@@ -290,33 +301,38 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to listen on %s:%d\n", LISTEN_IP, LISTEN_PORT);
         return 1;
     }
-    printf("Listening for clients on %s:%d\n", LISTEN_IP, LISTEN_PORT);
-    fflush(stdout);
 
-    /* Accept loop (single-threaded client handling) */
+    // --- DEBUG: Confirm Kernel Binding ---
+    debug_socket("LISTENER_CHECK", listen_fd);
+    // -------------------------------------
+
+    printf("Listening for clients on %s:%d\n", LISTEN_IP, LISTEN_PORT);
+
+    /* Accept loop */
     for (;;) {
-        printf("[SERVER] waiting in accept()...\n");
-        fflush(stdout);
+        printf("[SERVER] Ready. Waiting in accept() for new client...\n");
 
         struct sockaddr_in peer;
         socklen_t peerlen = sizeof(peer);
         int c = accept(listen_fd, (struct sockaddr*)&peer, &peerlen);
+        
         if (c < 0) {
-            perror("accept");
+            perror("accept failed");
             continue;
         }
 
         char peer_ip[INET_ADDRSTRLEN] = {0};
         inet_ntop(AF_INET, &peer.sin_addr, peer_ip, sizeof(peer_ip));
-        printf("[CLIENT] accepted %s:%u (fd=%d)\n", peer_ip, ntohs(peer.sin_port), c);
-        fflush(stdout);
-
+        printf("[CLIENT] >>> Connection ACCEPTED from %s:%u (fd=%d)\n", peer_ip, ntohs(peer.sin_port), c);
+        
         const char *msg = "WELCOME\n";
         write(c, msg, strlen(msg));
 
+        // This blocks the main thread! 
+        // If a client connects and does nothing, NO ONE ELSE CAN CONNECT.
         protocol_handle_client(c, db);
 
-        /* protocol_handle_client closes c; if you change that later, close(c) here. */
+        printf("[CLIENT] <<< Connection CLOSED (fd=%d)\n", c);
     }
 
     return 0;
