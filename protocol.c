@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <arpa/inet.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #include "user_db.h"
 
@@ -12,16 +13,16 @@
 enum { PROTO_V1 = 0x01 };
 
 enum MsgType {
-    MSG_SERVER_REG_REQ   = 0x00, 
-    MSG_SERVER_REG_RES   = 0x01, 
-    MSG_HEALTH_REQ       = 0x08, 
-    MSG_HEALTH_RES       = 0x09, 
-    MSG_ACCT_REG_REQ     = 0x10, 
-    MSG_ACCT_REG_RES     = 0x11, 
-    MSG_LOGIN_LOGOUT_REQ = 0x14, 
-    MSG_LOGIN_LOGOUT_RES = 0x15, 
-    MSG_LOG_REQ          = 0x18, 
-    MSG_LOG_RES          = 0x19  
+    MSG_SERVER_REG_REQ   = 0x00,
+    MSG_SERVER_REG_RES   = 0x01,
+    MSG_HEALTH_REQ       = 0x08,
+    MSG_HEALTH_RES       = 0x09,
+    MSG_ACCT_REG_REQ     = 0x10,
+    MSG_ACCT_REG_RES     = 0x11,
+    MSG_LOGIN_LOGOUT_REQ = 0x14,
+    MSG_LOGIN_LOGOUT_RES = 0x15,
+    MSG_LOG_REQ          = 0x18,
+    MSG_LOG_RES          = 0x19
 };
 
 #pragma pack(push, 1)
@@ -44,7 +45,7 @@ typedef struct {
     uint8_t username16[16];
     uint8_t password16[16];
     uint8_t client_id;
-    uint8_t status;    
+    uint8_t status = 0;
 } BodyAuth; // Used for Acct Reg and Login/Logout
 
 // Forward Logs: 1 byte ID + 2 byte len + data
@@ -86,13 +87,13 @@ static int write_exact(int fd, const void *buf, size_t n) {
     return 0; // Success
 }
 
-/* Updated: 'status' is now hardcoded to 0 internally */
-static int send_response(int fd, uint8_t type, 
+/* Updated: header status is NOT hardcoded anymore */
+static int send_response(int fd, uint8_t type, uint8_t hdr_status,
                          const void *body, uint32_t body_len) {
     WireHeader h;
     h.version  = PROTO_V1;
     h.type     = type;
-    h.status   = 0;
+    h.status   = hdr_status;    // <-- now meaningful
     h.padding  = 0;
     h.size_be  = htonl(body_len);
 
@@ -120,15 +121,15 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
     if (h.version != PROTO_V1) {
         // Protocol mismatch
-        send_response(client_fd, h.type, NULL, 0);
-        return -1; 
+        send_response(client_fd, h.type, 0, NULL, 0);
+        return -1;
     }
 
     uint32_t body_len = ntohl(h.size_be);
-    
+
     // Safety check for huge payloads
-    if (body_len > 65536 + 100) { 
-        send_response(client_fd, h.type, NULL, 0);
+    if (body_len > 65536 + 100) {
+        send_response(client_fd, h.type, 0, NULL, 0);
         return -1;
     }
 
@@ -136,7 +137,7 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
     if (body_len > 0) {
         body = (uint8_t*)malloc(body_len);
         if (!body) {
-            send_response(client_fd, h.type, NULL, 0);
+            send_response(client_fd, h.type, 0, NULL, 0);
             return 1;
         }
         if (read_exact(client_fd, body, body_len) <= 0) {
@@ -149,18 +150,18 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
     switch (h.type) {
 
         case MSG_SERVER_REG_REQ: { // 0x00
-            send_response(client_fd, MSG_SERVER_REG_RES, body, body_len);
+            send_response(client_fd, MSG_SERVER_REG_RES, 1, body, body_len);
             break;
         }
 
         case MSG_HEALTH_REQ: { // 0x08
-            send_response(client_fd, MSG_HEALTH_RES, body, body_len);
+            send_response(client_fd, MSG_HEALTH_RES, 1, body, body_len);
             break;
         }
 
         case MSG_ACCT_REG_REQ: { // 0x10
             if (body_len != sizeof(BodyAuth)) {
-                send_response(client_fd, MSG_ACCT_REG_RES, NULL, 0);
+                send_response(client_fd, MSG_ACCT_REG_RES, 0, NULL, 0);
                 break;
             }
             BodyAuth req;
@@ -173,17 +174,18 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
             printf("[DB] Create User '%s': %d\n", username, st);
 
             if (st == UDB_OK) {
-                req.status = 1; // Success body status (distinct from header status)
-                send_response(client_fd, MSG_ACCT_REG_RES, &req, sizeof(req));
+                // Keep body.status for client semantics if they use it
+                req.status = 1;
+                send_response(client_fd, MSG_ACCT_REG_RES, 1, &req, sizeof(req));
             } else {
-                 send_response(client_fd, MSG_ACCT_REG_RES, NULL, 0);
+                send_response(client_fd, MSG_ACCT_REG_RES, 0, NULL, 0);
             }
             break;
         }
 
         case MSG_LOGIN_LOGOUT_REQ: { // 0x14
             if (body_len != sizeof(BodyAuth)) {
-                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, NULL, 0);
+                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, 0, NULL, 0);
                 break;
             }
             BodyAuth req;
@@ -208,35 +210,36 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
                 if (success) {
                     printf("[DB] Login Success: %s\n", username);
-                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, &req, sizeof(req));
+                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, 1, &req, sizeof(req));
                 } else {
                     printf("[DB] Login Failed: %s\n", username);
-                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, NULL, 0);
+                    send_response(client_fd, MSG_LOGIN_LOGOUT_RES, 0, NULL, 0);
                 }
-            } 
-            else { // LOGOUT
+            } else { // LOGOUT
                 printf("[DB] Logout: %s\n", username);
-                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, &req, sizeof(req));
+                send_response(client_fd, MSG_LOGIN_LOGOUT_RES, 1, &req, sizeof(req));
             }
             break;
         }
 
         case MSG_LOG_REQ: { // 0x18
             if (body_len < 3) {
-                 send_response(client_fd, MSG_LOG_RES, NULL, 0);
-                 break;
+                send_response(client_fd, MSG_LOG_RES, 0, NULL, 0);
+                break;
             }
             BodyLogHeader log_h;
             memcpy(&log_h, body, 3);
             uint16_t actual_log_len = ntohs(log_h.log_len_be);
-            
-            printf("[LOG] Recv %d bytes from Server ID %d\n", actual_log_len, log_h.server_id);
-            send_response(client_fd, MSG_LOG_RES, NULL, 0);
+
+            printf("[LOG] Recv %u bytes from Server ID %u\n",
+                   (unsigned)actual_log_len, (unsigned)log_h.server_id);
+
+            send_response(client_fd, MSG_LOG_RES, 1, NULL, 0);
             break;
         }
 
         default:
-            send_response(client_fd, h.type, NULL, 0);
+            send_response(client_fd, h.type, 0, NULL, 0);
             break;
     }
 

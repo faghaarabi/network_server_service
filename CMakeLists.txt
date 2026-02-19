@@ -1,26 +1,23 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.16)
 project(network_server_service C)
 
 set(CMAKE_C_STANDARD 11)
 
-# Library for DB helpers
-add_library(user_db
-        src/user_db.c
-)
-target_include_directories(user_db PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+include_directories(${CMAKE_SOURCE_DIR}/include)
 
-# Main server app (name must NOT be "server" because you have server/ dir)
 add_executable(server_app
-        main.c
-        protocol.c
+  main.c
+  protocol.c
+  src/user_db.c
 )
-target_link_libraries(server_app PRIVATE user_db)
 
-# Optional: db_test executable
-add_executable(db_test
-        src/db_test.c
-        protocol.h
-)
-target_link_libraries(db_test PRIVATE user_db)
+find_package(Threads REQUIRED)
+target_link_libraries(server_app Threads::Threads)
+
+if (EXISTS "${CMAKE_SOURCE_DIR}/src/db_test.c")
+  add_executable(db_test
+    src/db_test.c
+    src/user_db.c
+  )
+  target_link_libraries(db_test Threads::Threads)
+endif()
