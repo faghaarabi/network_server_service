@@ -9,6 +9,7 @@ add_executable(server_app
   main.c
   protocol.c
   src/user_db.c
+        mini_client.c
 )
 
 find_package(Threads REQUIRED)
