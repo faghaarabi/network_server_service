@@ -339,11 +339,11 @@ int main(int argc, char **argv) {
 
     const char *LISTEN_IP = get_arg(argc, argv, "--listen-ip");
     if (!LISTEN_IP) LISTEN_IP = "0.0.0.0";
-    int LISTEN_PORT = get_int_arg(argc, argv, "--listen-port", 6000);
+    int LISTEN_PORT = get_int_arg(argc, argv, "--listen-port", 8080);
 
     const char *MGR_IP = get_arg(argc, argv, "--mgr-ip");
     if (!MGR_IP) MGR_IP = "192.168.0.34";
-    int MGR_PORT = get_int_arg(argc, argv, "--mgr-port", 6000);
+    int MGR_PORT = get_int_arg(argc, argv, "--mgr-port", 8080);
 
     int server_id_int = get_int_arg(argc, argv, "--server-id", 1);
     if (server_id_int < 0) server_id_int = 1;

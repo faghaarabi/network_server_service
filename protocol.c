@@ -8,7 +8,8 @@
 //   - User: Read                            0x12/0x13  (49 bytes)
 //   - User: Update (Login/Logout)           0x14/0x15  (37 bytes)
 //
-// Implements (channel milestone: one pre-defined channel):
+// Implements (channel layer):
+//   - Channel: Create                       0x20/0x21  (49 bytes) [project extension]
 //   - Channel: Read (Get Channel Info)      0x22/0x23  (48 req, 50+N res) [RFC]
 //   - Channels: Read (List Channels)        0x2A/0x2B  (32 or 33 req, 33+N res) [RFC + tolerant]
 //
@@ -77,7 +78,7 @@ enum {
 
 enum { CRUD_CREATE = 0x00, CRUD_READ = 0x01, CRUD_UPDATE = 0x02, CRUD_DELETE = 0x03 };
 
-/* Message types (RFC) */
+/* Message types (RFC + project extension for Channel.Create) */
 enum MsgType {
     /* Server */
     MSG_SERVER_REG_REQ      = (RES_SERVER << 3) | (CRUD_CREATE << 1) | 0, /* 0x00 */
@@ -106,10 +107,12 @@ enum MsgType {
     MSG_LOG_CREATE_RES      = (RES_LOG    << 3) | (CRUD_CREATE << 1) | 1, /* 0x19 */
 
     /* Channel / Channels */
-    MSG_CHANNEL_READ_REQ    = (RES_CHANNEL  << 3) | (CRUD_READ << 1) | 0, /* 0x22 */
-    MSG_CHANNEL_READ_RES    = (RES_CHANNEL  << 3) | (CRUD_READ << 1) | 1, /* 0x23 */
-    MSG_CHANNELS_READ_REQ   = (RES_CHANNELS << 3) | (CRUD_READ << 1) | 0, /* 0x2A */
-    MSG_CHANNELS_READ_RES   = (RES_CHANNELS << 3) | (CRUD_READ << 1) | 1  /* 0x2B */
+    MSG_CHANNEL_CREATE_REQ  = (RES_CHANNEL  << 3) | (CRUD_CREATE << 1) | 0, /* 0x20 */
+    MSG_CHANNEL_CREATE_RES  = (RES_CHANNEL  << 3) | (CRUD_CREATE << 1) | 1, /* 0x21 */
+    MSG_CHANNEL_READ_REQ    = (RES_CHANNEL  << 3) | (CRUD_READ   << 1) | 0, /* 0x22 */
+    MSG_CHANNEL_READ_RES    = (RES_CHANNEL  << 3) | (CRUD_READ   << 1) | 1, /* 0x23 */
+    MSG_CHANNELS_READ_REQ   = (RES_CHANNELS << 3) | (CRUD_READ   << 1) | 0, /* 0x2A */
+    MSG_CHANNELS_READ_RES   = (RES_CHANNELS << 3) | (CRUD_READ   << 1) | 1  /* 0x2B */
 };
 
 /* ---- Compatibility aliases (keep old tests working) ----
@@ -125,9 +128,7 @@ enum {
     MSG_OLD_SERVER_ACTIVATE_RES = 0x05
 };
 
-/* Largest body from RFC: Message Read max 65579; your earlier guard was 65539 (logs max).
-   Keep a safe cap that covers RFC 0.2 messaging too.
-*/
+/* Largest body from RFC: Message Read max 65579 */
 enum { BIG_MAX_BODY = 65579 };
 
 #pragma pack(push, 1)
@@ -169,6 +170,14 @@ typedef struct {
     uint8_t target_user_id;
 } BodyUserRead;
 
+/* Channel Create: 49 bytes */
+typedef struct {
+    uint8_t auth_username16[16];
+    uint8_t auth_password16[16];
+    uint8_t channel_name16[16];
+    uint8_t channel_id; /* request sets 0; response assigns */
+} BodyChannelCreate;
+
 /* Channel Read request: 48 bytes (Auth + ChannelName) */
 typedef struct {
     uint8_t auth_username16[16];
@@ -205,6 +214,32 @@ typedef struct {
 
 #pragma pack(pop)
 
+#define MAX_CHANNELS 32
+#define MAX_CHANNEL_MEMBERS 64
+
+typedef struct {
+    bool in_use;
+    uint8_t channel_id;
+    uint8_t channel_name16[16];
+    uint8_t member_count;
+    uint8_t member_ids[MAX_CHANNEL_MEMBERS];
+    uint8_t owner_user_id;
+} Channel;
+
+typedef struct {
+    bool found;
+    uint8_t channel_id;
+    uint8_t channel_name16[16];
+    uint8_t member_count;
+    uint8_t member_ids[MAX_CHANNEL_MEMBERS];
+    uint8_t owner_user_id;
+} ChannelSnapshot;
+
+static pthread_mutex_t g_channels_mu = PTHREAD_MUTEX_INITIALIZER;
+static Channel g_channels[MAX_CHANNELS];
+static uint8_t g_next_channel_id = 1;
+static pthread_once_t g_channels_once = PTHREAD_ONCE_INIT;
+
 /* ---------- UID allocator + UID->Username mapping ---------- */
 static pthread_mutex_t g_uid_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t g_next_uid = 1;
@@ -238,6 +273,20 @@ static bool uidmap_get(uint8_t uid, uint8_t out_username16[16]) {
     return ok;
 }
 
+static bool uidmap_find_by_username(const uint8_t username16[16], uint8_t *out_uid) {
+    int i;
+    pthread_mutex_lock(&g_uidmap_mu);
+    for (i = 1; i < 256; i++) {
+        if (g_uid_present[i] && memcmp(g_uid_username16[i], username16, 16) == 0) {
+            if (out_uid) *out_uid = (uint8_t)i;
+            pthread_mutex_unlock(&g_uidmap_mu);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_uidmap_mu);
+    return false;
+}
+
 /* ---------- Activated server state ---------- */
 static pthread_mutex_t g_active_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool g_active_set = false;
@@ -258,14 +307,181 @@ static bool active_get(Body5 *out) {
     return ok;
 }
 
-/* ---------- One pre-defined channel state (milestone) ---------- */
-static pthread_mutex_t g_chan_mu = PTHREAD_MUTEX_INITIALIZER;
-static bool g_chan_set = true; /* pre-created */
-static uint8_t g_chan_id = 1;
-static uint8_t g_chan_name16[16] = {
-    'g','e','n','e','r','a','l',0,0,0,0,0,0,0,0,0
-};
-/* For now, no members tracked (UserIds list empty) */
+/* ---------- Channel storage ---------- */
+static void channels_init_once(void) {
+    memset(g_channels, 0, sizeof(g_channels));
+
+    /* Keep a default channel for compatibility with earlier tests */
+    g_channels[0].in_use = true;
+    g_channels[0].channel_id = 1;
+    memset(g_channels[0].channel_name16, 0, 16);
+    memcpy(g_channels[0].channel_name16, "general", 7);
+    g_channels[0].member_count = 0;
+    g_channels[0].owner_user_id = 0;
+
+    g_next_channel_id = 2;
+}
+
+static void ensure_channels_initialized(void) {
+    pthread_once(&g_channels_once, channels_init_once);
+}
+
+static uint8_t alloc_channel_id_locked(void) {
+    uint8_t start = g_next_channel_id;
+    uint8_t id = start;
+
+    if (id == 0) id = 1;
+
+    do {
+        bool used = false;
+        int i;
+
+        for (i = 0; i < MAX_CHANNELS; i++) {
+            if (g_channels[i].in_use && g_channels[i].channel_id == id) {
+                used = true;
+                break;
+            }
+        }
+
+        if (!used) {
+            g_next_channel_id = (uint8_t)(id + 1);
+            if (g_next_channel_id == 0) g_next_channel_id = 1;
+            return id;
+        }
+
+        id = (uint8_t)(id + 1);
+        if (id == 0) id = 1;
+    } while (id != start);
+
+    return 0;
+}
+
+static int channel_find_index_by_name_locked(const uint8_t name16[16]) {
+    int i;
+    for (i = 0; i < MAX_CHANNELS; i++) {
+        if (g_channels[i].in_use && memcmp(g_channels[i].channel_name16, name16, 16) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int channel_find_index_by_id_locked(uint8_t channel_id) {
+    int i;
+    for (i = 0; i < MAX_CHANNELS; i++) {
+        if (g_channels[i].in_use && g_channels[i].channel_id == channel_id) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool channel_has_member_locked(const Channel *ch, uint8_t user_id) {
+    uint8_t i;
+    if (!ch || user_id == 0) return false;
+    for (i = 0; i < ch->member_count; i++) {
+        if (ch->member_ids[i] == user_id) return true;
+    }
+    return false;
+}
+
+static bool channel_add_member_locked(Channel *ch, uint8_t user_id) {
+    if (!ch || user_id == 0) return false;
+    if (channel_has_member_locked(ch, user_id)) return true;
+    if (ch->member_count >= MAX_CHANNEL_MEMBERS) return false;
+
+    ch->member_ids[ch->member_count++] = user_id;
+    return true;
+}
+
+static bool channel_create_with_owner(const uint8_t name16[16], uint8_t owner_user_id, uint8_t *out_channel_id) {
+    int slot = -1;
+    int i;
+
+    ensure_channels_initialized();
+
+    pthread_mutex_lock(&g_channels_mu);
+
+    if (channel_find_index_by_name_locked(name16) >= 0) {
+        pthread_mutex_unlock(&g_channels_mu);
+        return false;
+    }
+
+    for (i = 0; i < MAX_CHANNELS; i++) {
+        if (!g_channels[i].in_use) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_channels_mu);
+        return false;
+    }
+
+    memset(&g_channels[slot], 0, sizeof(g_channels[slot]));
+    g_channels[slot].in_use = true;
+    g_channels[slot].channel_id = alloc_channel_id_locked();
+    memcpy(g_channels[slot].channel_name16, name16, 16);
+    g_channels[slot].owner_user_id = owner_user_id;
+
+    if (owner_user_id != 0) {
+        if (!channel_add_member_locked(&g_channels[slot], owner_user_id)) {
+            g_channels[slot].in_use = false;
+            pthread_mutex_unlock(&g_channels_mu);
+            return false;
+        }
+    }
+
+    if (out_channel_id) *out_channel_id = g_channels[slot].channel_id;
+
+    pthread_mutex_unlock(&g_channels_mu);
+    return true;
+}
+
+static bool channel_snapshot_by_name(const uint8_t name16[16], ChannelSnapshot *out) {
+    int idx;
+
+    ensure_channels_initialized();
+
+    if (!out) return false;
+
+    pthread_mutex_lock(&g_channels_mu);
+    idx = channel_find_index_by_name_locked(name16);
+    if (idx < 0) {
+        pthread_mutex_unlock(&g_channels_mu);
+        memset(out, 0, sizeof(*out));
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->found = true;
+    out->channel_id = g_channels[idx].channel_id;
+    memcpy(out->channel_name16, g_channels[idx].channel_name16, 16);
+    out->member_count = g_channels[idx].member_count;
+    memcpy(out->member_ids, g_channels[idx].member_ids, g_channels[idx].member_count);
+    out->owner_user_id = g_channels[idx].owner_user_id;
+
+    pthread_mutex_unlock(&g_channels_mu);
+    return true;
+}
+
+static uint8_t channels_collect_ids(uint8_t out_ids[255]) {
+    uint8_t count = 0;
+    int i;
+
+    ensure_channels_initialized();
+
+    pthread_mutex_lock(&g_channels_mu);
+    for (i = 0; i < MAX_CHANNELS && count < 255; i++) {
+        if (g_channels[i].in_use) {
+            out_ids[count++] = g_channels[i].channel_id;
+        }
+    }
+    pthread_mutex_unlock(&g_channels_mu);
+
+    return count;
+}
 
 /* ---------- I/O helpers ---------- */
 static int read_exact(int fd, void *buf, size_t n) {
@@ -303,7 +519,8 @@ static inline uint8_t type_crud(uint8_t type)      { return (type >> 1) & 0x03; 
 static inline uint8_t type_resource(uint8_t type)  { return (type >> 3) & 0x1F; }
 static inline uint8_t make_resp_type(uint8_t req_type) { return (uint8_t)((req_type & 0xFE) | 0x01); }
 
-/* Validate resource/action combinations per RFC (strict), but allow our old aliases too. */
+/* Validate resource/action combinations per RFC, plus Channel.Create extension,
+   and allow our old aliases too. */
 static bool is_valid_type_combo(uint8_t type) {
     uint8_t r = type_resource(type);
     uint8_t a = type_crud(type);
@@ -315,14 +532,29 @@ static bool is_valid_type_combo(uint8_t type) {
     if (type == MSG_OLD_SERVER_GET_REQ || type == MSG_OLD_SERVER_ACTIVATE_REQ) return true;
 
     switch (r) {
-        case RES_SERVER:          return (a == CRUD_CREATE) || (a == CRUD_UPDATE);
-        case RES_ACTIVATEDSERVER: return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_DELETE);
-        case RES_USER:            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE);
-        case RES_LOG:             return (a == CRUD_CREATE);
-        case RES_CHANNEL:         return (a == CRUD_READ);
-        case RES_CHANNELS:        return (a == CRUD_READ);
-        case RES_MESSAGE:         return (a == CRUD_CREATE) || (a == CRUD_READ);
-        default:                  return false;
+        case RES_SERVER:
+            return (a == CRUD_CREATE) || (a == CRUD_UPDATE);
+
+        case RES_ACTIVATEDSERVER:
+            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_DELETE);
+
+        case RES_USER:
+            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE);
+
+        case RES_LOG:
+            return (a == CRUD_CREATE);
+
+        case RES_CHANNEL:
+            return (a == CRUD_CREATE) || (a == CRUD_READ); /* project extension */
+
+        case RES_CHANNELS:
+            return (a == CRUD_READ);
+
+        case RES_MESSAGE:
+            return (a == CRUD_CREATE) || (a == CRUD_READ);
+
+        default:
+            return false;
     }
 }
 
@@ -360,9 +592,11 @@ static bool auth_ok16(user_db_t *db, const uint8_t username16[16], const uint8_t
         return false;
     }
 
-    bool ok = (stored_len >= 16) && (memcmp(stored, password16, 16) == 0);
-    free(stored);
-    return ok;
+    {
+        bool ok = (stored_len >= 16) && (memcmp(stored, password16, 16) == 0);
+        free(stored);
+        return ok;
+    }
 }
 
 /* ---------- sending ---------- */
@@ -391,6 +625,14 @@ static int send_response_keepalive(int fd, uint8_t type, uint8_t status,
 
 static void zero16(uint8_t a[16]) { memset(a, 0, 16); }
 
+static bool all_zero16(const uint8_t a[16]) {
+    int i;
+    for (i = 0; i < 16; i++) {
+        if (a[i] != 0) return false;
+    }
+    return true;
+}
+
 /* ---------- main handler ---------- */
 int protocol_handle_one(int client_fd, user_db_t *db)
 {
@@ -417,259 +659,311 @@ int protocol_handle_one(int client_fd, user_db_t *db)
         return -1;
     }
 
-    uint32_t body_len = ntohl(h.size_be);
-    if (body_len > BIG_MAX_BODY) {
-        (void)send_response_raw(client_fd, resp_type, ST_MessageTooLarge, NULL, 0);
-        return -1;
-    }
+    {
+        uint32_t body_len = ntohl(h.size_be);
+        uint8_t *body = NULL;
 
-    uint8_t *body = NULL;
-    if (body_len > 0) {
-        body = (uint8_t *)malloc(body_len);
-        if (!body) {
-            (void)send_response_raw(client_fd, resp_type, ST_ResourceExhausted, NULL, 0);
+        if (body_len > BIG_MAX_BODY) {
+            (void)send_response_raw(client_fd, resp_type, ST_MessageTooLarge, NULL, 0);
             return -1;
         }
-        if (read_exact(client_fd, body, body_len) <= 0) {
-            free(body);
-            return -1;
-        }
-    }
 
-    /* ================= SERVER REGISTER (5 bytes) ================= */
-    if (h.type == MSG_SERVER_REG_REQ) {
-        if (body_len != (uint32_t)sizeof(Body5)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_SERVER_REG_RES, ST_InvalidSize, NULL, 0);
+        if (body_len > 0) {
+            body = (uint8_t *)malloc(body_len);
+            if (!body) {
+                (void)send_response_raw(client_fd, resp_type, ST_ResourceExhausted, NULL, 0);
+                return -1;
+            }
+            if (read_exact(client_fd, body, body_len) <= 0) {
+                free(body);
+                return -1;
+            }
         }
-        Body5 req;
-        memcpy(&req, body, sizeof(req));
+
+        /* ================= SERVER REGISTER (5 bytes) ================= */
+        if (h.type == MSG_SERVER_REG_REQ) {
+            if (body_len != (uint32_t)sizeof(Body5)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_SERVER_REG_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                Body5 req;
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                /* Minimal: accept and echo back */
+                return send_response_keepalive(client_fd, MSG_SERVER_REG_RES, ST_OK,
+                                               &req, (uint32_t)sizeof(req));
+            }
+        }
+
+        /* ================= ActivatedServer Activate (RFC 0x08) ================= */
+        if (h.type == MSG_ACTIVATE_REQ || h.type == MSG_OLD_SERVER_ACTIVATE_REQ) {
+            if (body_len != (uint32_t)sizeof(Body5)) {
+                uint8_t t = (h.type == MSG_OLD_SERVER_ACTIVATE_REQ) ? MSG_OLD_SERVER_ACTIVATE_RES : MSG_ACTIVATE_RES;
+                free(body);
+                return send_response_keepalive(client_fd, t, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                Body5 req;
+                uint8_t t = (h.type == MSG_OLD_SERVER_ACTIVATE_REQ) ? MSG_OLD_SERVER_ACTIVATE_RES : MSG_ACTIVATE_RES;
+
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                active_set(&req);
+                return send_response_keepalive(client_fd, t, ST_OK, &req, (uint32_t)sizeof(req));
+            }
+        }
+
+        /* ================= ActivatedServer GetActive (RFC 0x0A) ================= */
+        if (h.type == MSG_GET_ACTIVE_REQ || h.type == MSG_OLD_SERVER_GET_REQ) {
+            /* Be tolerant: allow 0 or 5; if 5, ignore contents. */
+            if (!(body_len == 0 || body_len == (uint32_t)sizeof(Body5))) {
+                uint8_t t = (h.type == MSG_OLD_SERVER_GET_REQ) ? MSG_OLD_SERVER_GET_RES : MSG_GET_ACTIVE_RES;
+                free(body);
+                return send_response_keepalive(client_fd, t, ST_InvalidSize, NULL, 0);
+            }
+
+            free(body);
+
+            {
+                Body5 res;
+                uint8_t t = (h.type == MSG_OLD_SERVER_GET_REQ) ? MSG_OLD_SERVER_GET_RES : MSG_GET_ACTIVE_RES;
+
+                memset(&res, 0, sizeof(res));
+                if (!active_get(&res)) {
+                    return send_response_keepalive(client_fd, t, ST_NotRegistered, NULL, 0);
+                }
+
+                return send_response_keepalive(client_fd, t, ST_OK, &res, (uint32_t)sizeof(res));
+            }
+        }
+
+        /* ================= USER CREATE (33 bytes) ================= */
+        if (h.type == MSG_USER_CREATE_REQ) {
+            if (body_len != (uint32_t)sizeof(BodyUserCreate)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyUserCreate req;
+                char key[17];
+
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                username16_to_key(req.username16, key);
+
+                pthread_mutex_lock(&g_db_mu);
+                {
+                    udb_status_t st = user_db_put(db, key, req.password16, 16, false);
+                    pthread_mutex_unlock(&g_db_mu);
+
+                    if (st == UDB_OK) {
+                        req.user_id = alloc_uid();
+                        uidmap_set(req.user_id, req.username16);
+                        return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_OK,
+                                                       &req, (uint32_t)sizeof(req));
+                    }
+
+                    if (udb_is_exists(st)) {
+                        return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_AlreadyExists, NULL, 0);
+                    }
+
+                    return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_InternalError, NULL, 0);
+                }
+            }
+        }
+
+        /* ================= USER UPDATE (Login/Logout) (37 bytes) ================= */
+        if (h.type == MSG_USER_UPDATE_REQ) {
+            if (body_len != (uint32_t)sizeof(BodyUserUpdate)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyUserUpdate req;
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                if (!auth_ok16(db, req.username16, req.password16)) {
+                    return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidCreds, NULL, 0);
+                }
+
+                /* Tolerant: accept only 0 or 1 */
+                if (!(req.user_status == 0 || req.user_status == 1)) {
+                    return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_MalformedRequest, NULL, 0);
+                }
+
+                return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_OK,
+                                               &req, (uint32_t)sizeof(req));
+            }
+        }
+
+        /* ================= USER READ (49 bytes) ================= */
+        if (h.type == MSG_USER_READ_REQ) {
+            if (body_len != (uint32_t)sizeof(BodyUserRead)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyUserRead req;
+                uint8_t uname16[16];
+                BodyUserRead resbody;
+
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+                    return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_InvalidCreds, NULL, 0);
+                }
+
+                if (!uidmap_get(req.target_user_id, uname16)) {
+                    return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_NotFound, NULL, 0);
+                }
+
+                memset(&resbody, 0, sizeof(resbody));
+                memcpy(resbody.auth_username16, req.auth_username16, 16);
+                memcpy(resbody.auth_password16, req.auth_password16, 16);
+                memcpy(resbody.username16, uname16, 16);
+                resbody.target_user_id = req.target_user_id;
+
+                return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_OK,
+                                               &resbody, (uint32_t)sizeof(resbody));
+            }
+        }
+
+        /* ================= CHANNEL CREATE (49 bytes) ================= */
+        if (h.type == MSG_CHANNEL_CREATE_REQ) {
+            if (body_len != (uint32_t)sizeof(BodyChannelCreate)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyChannelCreate req;
+                uint8_t owner_uid = 0;
+                uint8_t new_channel_id = 0;
+
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_InvalidCreds, NULL, 0);
+                }
+
+                if (all_zero16(req.channel_name16)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_MalformedRequest, NULL, 0);
+                }
+
+                if (!uidmap_find_by_username(req.auth_username16, &owner_uid)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_NotRegistered, NULL, 0);
+                }
+
+                if (!channel_create_with_owner(req.channel_name16, owner_uid, &new_channel_id)) {
+                    ChannelSnapshot snap;
+                    if (channel_snapshot_by_name(req.channel_name16, &snap)) {
+                        return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_AlreadyExists, NULL, 0);
+                    }
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_ResourceExhausted, NULL, 0);
+                }
+
+                req.channel_id = new_channel_id;
+                return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_OK,
+                                               &req, (uint32_t)sizeof(req));
+            }
+        }
+
+        /* ================= CHANNELS READ (List All Channels) ================= */
+        if (h.type == MSG_CHANNELS_READ_REQ) {
+            if (!(body_len == (uint32_t)sizeof(BodyAuth32) ||
+                  body_len >= (uint32_t)sizeof(BodyChannelsReadReq33))) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyAuth32 auth;
+                uint8_t ids[255];
+                uint8_t count;
+                uint8_t out[32 + 1 + 255];
+                size_t off = 0;
+
+                if (body_len < (uint32_t)sizeof(BodyAuth32)) {
+                    free(body);
+                    return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
+                }
+
+                memcpy(&auth, body, sizeof(auth));
+                free(body);
+
+                if (!auth_ok16(db, auth.auth_username16, auth.auth_password16)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidCreds, NULL, 0);
+                }
+
+                count = channels_collect_ids(ids);
+
+                memset(out, 0, 32);
+                off += 32;
+                out[off++] = count;
+                if (count > 0) {
+                    memcpy(&out[off], ids, count);
+                    off += count;
+                }
+
+                return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_OK, out, (uint32_t)off);
+            }
+        }
+
+        /* ================= CHANNEL READ (Get Channel Info) ================= */
+        if (h.type == MSG_CHANNEL_READ_REQ) {
+            if (body_len != (uint32_t)sizeof(BodyChannelReadReq)) {
+                free(body);
+                return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidSize, NULL, 0);
+            }
+
+            {
+                BodyChannelReadReq req;
+                ChannelSnapshot snap;
+                uint8_t out[50 + MAX_CHANNEL_MEMBERS];
+                size_t off = 0;
+
+                memcpy(&req, body, sizeof(req));
+                free(body);
+
+                if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidCreds, NULL, 0);
+                }
+
+                if (!channel_snapshot_by_name(req.channel_name16, &snap)) {
+                    return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_NotFound, NULL, 0);
+                }
+
+                memset(out, 0, 32);
+                off += 32;
+                memcpy(&out[off], snap.channel_name16, 16);
+                off += 16;
+                out[off++] = snap.channel_id;
+                out[off++] = snap.member_count;
+                if (snap.member_count > 0) {
+                    memcpy(&out[off], snap.member_ids, snap.member_count);
+                    off += snap.member_count;
+                }
+
+                return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_OK, out, (uint32_t)off);
+            }
+        }
+
+        /* Unknown type (for now) */
         free(body);
-
-        /* Minimal: accept and echo back */
-        return send_response_keepalive(client_fd, MSG_SERVER_REG_RES, ST_OK,
-                                       &req, (uint32_t)sizeof(req));
+        return send_response_keepalive(client_fd, resp_type, ST_InvalidType, NULL, 0);
     }
-
-    /* ================= ActivatedServer Activate (RFC 0x08) ================= */
-    if (h.type == MSG_ACTIVATE_REQ || h.type == MSG_OLD_SERVER_ACTIVATE_REQ) {
-        if (body_len != (uint32_t)sizeof(Body5)) {
-            free(body);
-            uint8_t t = (h.type == MSG_OLD_SERVER_ACTIVATE_REQ) ? MSG_OLD_SERVER_ACTIVATE_RES : MSG_ACTIVATE_RES;
-            return send_response_keepalive(client_fd, t, ST_InvalidSize, NULL, 0);
-        }
-        Body5 req;
-        memcpy(&req, body, sizeof(req));
-        free(body);
-
-        active_set(&req);
-
-        uint8_t t = (h.type == MSG_OLD_SERVER_ACTIVATE_REQ) ? MSG_OLD_SERVER_ACTIVATE_RES : MSG_ACTIVATE_RES;
-        return send_response_keepalive(client_fd, t, ST_OK, &req, (uint32_t)sizeof(req));
-    }
-
-    /* ================= ActivatedServer GetActive (RFC 0x0A) ================= */
-    if (h.type == MSG_GET_ACTIVE_REQ || h.type == MSG_OLD_SERVER_GET_REQ) {
-        /* RFC says request body is 5 bytes (ignored). Old draft also used 5.
-           Be tolerant: allow 0 or 5; if 5, ignore contents. */
-        if (!(body_len == 0 || body_len == (uint32_t)sizeof(Body5))) {
-            free(body);
-            uint8_t t = (h.type == MSG_OLD_SERVER_GET_REQ) ? MSG_OLD_SERVER_GET_RES : MSG_GET_ACTIVE_RES;
-            return send_response_keepalive(client_fd, t, ST_InvalidSize, NULL, 0);
-        }
-        free(body);
-
-        Body5 res;
-        memset(&res, 0, sizeof(res));
-
-        if (!active_get(&res)) {
-            uint8_t t = (h.type == MSG_OLD_SERVER_GET_REQ) ? MSG_OLD_SERVER_GET_RES : MSG_GET_ACTIVE_RES;
-            return send_response_keepalive(client_fd, t, ST_NotRegistered, NULL, 0);
-        }
-
-        uint8_t t = (h.type == MSG_OLD_SERVER_GET_REQ) ? MSG_OLD_SERVER_GET_RES : MSG_GET_ACTIVE_RES;
-        return send_response_keepalive(client_fd, t, ST_OK, &res, (uint32_t)sizeof(res));
-    }
-
-    /* ================= USER CREATE (33 bytes) ================= */
-    if (h.type == MSG_USER_CREATE_REQ) {
-        if (body_len != (uint32_t)sizeof(BodyUserCreate)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        BodyUserCreate req;
-        memcpy(&req, body, sizeof(req));
-        free(body);
-
-        char key[17];
-        username16_to_key(req.username16, key);
-
-        /* store password as EXACTLY 16 bytes */
-        pthread_mutex_lock(&g_db_mu);
-        udb_status_t st = user_db_put(db, key, req.password16, 16, false);
-        pthread_mutex_unlock(&g_db_mu);
-
-        if (st == UDB_OK) {
-            req.user_id = alloc_uid();
-            uidmap_set(req.user_id, req.username16);
-            return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_OK,
-                                           &req, (uint32_t)sizeof(req));
-        }
-
-        if (udb_is_exists(st)) {
-            return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_AlreadyExists, NULL, 0);
-        }
-
-        return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_InternalError, NULL, 0);
-    }
-
-    /* ================= USER UPDATE (Login/Logout) (37 bytes) ================= */
-    if (h.type == MSG_USER_UPDATE_REQ) {
-        if (body_len != (uint32_t)sizeof(BodyUserUpdate)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        BodyUserUpdate req;
-        memcpy(&req, body, sizeof(req));
-        free(body);
-
-        if (!auth_ok16(db, req.username16, req.password16)) {
-            return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidCreds, NULL, 0);
-        }
-
-        /* Tolerant: accept only 0 or 1 (do not enforce meaning to avoid breaking existing clients) */
-        if (!(req.user_status == 0 || req.user_status == 1)) {
-            return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_MalformedRequest, NULL, 0);
-        }
-
-        return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_OK,
-                                       &req, (uint32_t)sizeof(req));
-    }
-
-    /* ================= USER READ (49 bytes) ================= */
-    if (h.type == MSG_USER_READ_REQ) {
-        if (body_len != (uint32_t)sizeof(BodyUserRead)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        BodyUserRead req;
-        memcpy(&req, body, sizeof(req));
-        free(body);
-
-        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
-            return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_InvalidCreds, NULL, 0);
-        }
-
-        uint8_t uname16[16];
-        if (!uidmap_get(req.target_user_id, uname16)) {
-            return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_NotFound, NULL, 0);
-        }
-
-        BodyUserRead resbody;
-        memset(&resbody, 0, sizeof(resbody));
-        memcpy(resbody.auth_username16, req.auth_username16, 16);
-        memcpy(resbody.auth_password16, req.auth_password16, 16);
-        memcpy(resbody.username16, uname16, 16);
-        resbody.target_user_id = req.target_user_id;
-
-        return send_response_keepalive(client_fd, MSG_USER_READ_RES, ST_OK,
-                                       &resbody, (uint32_t)sizeof(resbody));
-    }
-
-    /* ================= CHANNELS READ (List All Channels) ================= */
-    if (h.type == MSG_CHANNELS_READ_REQ) {
-        /* Accept both request bodies:
-           - 32 bytes (Auth only)
-           - 33+ bytes (Auth + channel_id_len + optional ids), as in your sheet
-        */
-        if (!(body_len == (uint32_t)sizeof(BodyAuth32) || body_len >= (uint32_t)sizeof(BodyChannelsReadReq33))) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        if (body_len < (uint32_t)sizeof(BodyAuth32)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        BodyAuth32 auth;
-        memcpy(&auth, body, sizeof(auth));
-
-        if (!auth_ok16(db, auth.auth_username16, auth.auth_password16)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidCreds, NULL, 0);
-        }
-
-        free(body);
-
-        /* Response: Auth fields SHOULD be zero unless otherwise specified */
-        uint8_t out[32 + 1 + 255];
-        size_t off = 0;
-
-        memset(out, 0, 32);
-        off += 32;
-
-        pthread_mutex_lock(&g_chan_mu);
-        bool has = g_chan_set;
-        uint8_t cid = g_chan_id;
-        pthread_mutex_unlock(&g_chan_mu);
-
-        out[off++] = has ? 1 : 0; /* ChannelIdLen */
-        if (has) out[off++] = cid;
-
-        return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_OK, out, (uint32_t)off);
-    }
-
-    /* ================= CHANNEL READ (Get Channel Info) ================= */
-    if (h.type == MSG_CHANNEL_READ_REQ) {
-        if (body_len != (uint32_t)sizeof(BodyChannelReadReq)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        BodyChannelReadReq req;
-        memcpy(&req, body, sizeof(req));
-        free(body);
-
-        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidCreds, NULL, 0);
-        }
-
-        pthread_mutex_lock(&g_chan_mu);
-        bool has = g_chan_set;
-        uint8_t cid = g_chan_id;
-        uint8_t cname16[16];
-        memcpy(cname16, g_chan_name16, 16);
-        pthread_mutex_unlock(&g_chan_mu);
-
-        if (!has) {
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_NotFound, NULL, 0);
-        }
-
-        /* Require matching channel name (simple) */
-        if (memcmp(req.channel_name16, cname16, 16) != 0) {
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_NotFound, NULL, 0);
-        }
-
-        /* Response fixed part: 50 bytes, no users for now */
-        BodyChannelReadRes50 res;
-        memset(&res, 0, sizeof(res));
-        /* Auth in response MUST be zero unless otherwise specified */
-        zero16(res.auth_username16);
-        zero16(res.auth_password16);
-        memcpy(res.channel_name16, cname16, 16);
-        res.channel_id = cid;
-        res.user_id_len = 0;
-
-        return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_OK, &res, (uint32_t)sizeof(res));
-    }
-
-    /* Unknown type (for now) */
-    free(body);
-    return send_response_keepalive(client_fd, resp_type, ST_InvalidType, NULL, 0);
 }
 
 void protocol_handle_client(int client_fd, user_db_t *db)
