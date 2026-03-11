@@ -1,5 +1,6 @@
-// protocol.c - BIG v0.2 RFC + Messaging Updated
+// protocol.c - BIG v0.2 RFC + Milestone 2 Messaging
 // Supports macOS ARM64 & Linux
+// Auto-joins all users to "milestone2" channel.
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -123,7 +124,7 @@ typedef struct {
 
 #pragma pack(pop)
 
-/* Portable 64-bit Endian Swapping */
+/* Portable 64-bit Endian Swapping for ARM64 macOS & Linux */
 static uint64_t swap_uint64(uint64_t val) {
     val = ((val << 8) & 0xFF00FF00FF00FF00ULL) | ((val >> 8) & 0x00FF00FF00FF00FFULL);
     val = ((val << 16) & 0xFFFF0000FFFF0000ULL) | ((val >> 16) & 0x0000FFFF0000FFFFULL);
@@ -137,7 +138,7 @@ static uint64_t my_htonll(uint64_t val) {
 static uint64_t my_ntohll(uint64_t val) { return my_htonll(val); }
 
 #define MAX_CHANNELS 32
-#define MAX_CHANNEL_MEMBERS 64
+#define MAX_CHANNEL_MEMBERS 255 /* Bumped to 255 to support max clients in milestone channel safely */
 
 typedef struct {
     bool in_use;
@@ -260,14 +261,15 @@ static bool active_get(Body5 *out) {
     return ok;
 }
 
-/* ---------- Channel storage ---------- */
+/* ---------- Channel storage & Auto-Join ---------- */
 static void channels_init_once(void) {
     memset(g_channels, 0, sizeof(g_channels));
     for (int i=0; i<256; i++) g_client_fds[i] = -1;
 
+    // Milestone 2 Hardcoded Channel Initialization
     g_channels[0].in_use = true;
     g_channels[0].channel_id = 1;
-    memcpy(g_channels[0].channel_name16, "general\0\0\0\0\0\0\0\0\0", 16);
+    memcpy(g_channels[0].channel_name16, "milestone2\0\0\0\0\0\0", 16);
     g_channels[0].member_count = 0;
     g_channels[0].owner_user_id = 0;
 
@@ -276,6 +278,31 @@ static void channels_init_once(void) {
 
 static void ensure_channels_initialized(void) {
     pthread_once(&g_channels_once, channels_init_once);
+}
+
+static bool channel_has_member_locked(const Channel *ch, uint8_t user_id) {
+    if (!ch || user_id == 0) return false;
+    for (uint8_t i = 0; i < ch->member_count; i++) {
+        if (ch->member_ids[i] == user_id) return true;
+    }
+    return false;
+}
+
+static bool channel_add_member_locked(Channel *ch, uint8_t user_id) {
+    if (!ch || user_id == 0) return false;
+    if (channel_has_member_locked(ch, user_id)) return true;
+    if (ch->member_count >= MAX_CHANNEL_MEMBERS) return false;
+    ch->member_ids[ch->member_count++] = user_id;
+    return true;
+}
+
+// Automatically add a user to the hardcoded milestone2 channel
+static void add_to_milestone2(uint8_t uid) {
+    if (uid == 0) return;
+    ensure_channels_initialized();
+    pthread_mutex_lock(&g_channels_mu);
+    channel_add_member_locked(&g_channels[0], uid);
+    pthread_mutex_unlock(&g_channels_mu);
 }
 
 static uint8_t alloc_channel_id_locked(void) {
@@ -306,22 +333,6 @@ static int channel_find_index_by_name_locked(const uint8_t name16[16]) {
         if (g_channels[i].in_use && memcmp(g_channels[i].channel_name16, name16, 16) == 0) return i;
     }
     return -1;
-}
-
-static bool channel_has_member_locked(const Channel *ch, uint8_t user_id) {
-    if (!ch || user_id == 0) return false;
-    for (uint8_t i = 0; i < ch->member_count; i++) {
-        if (ch->member_ids[i] == user_id) return true;
-    }
-    return false;
-}
-
-static bool channel_add_member_locked(Channel *ch, uint8_t user_id) {
-    if (!ch || user_id == 0) return false;
-    if (channel_has_member_locked(ch, user_id)) return true;
-    if (ch->member_count >= MAX_CHANNEL_MEMBERS) return false;
-    ch->member_ids[ch->member_count++] = user_id;
-    return true;
 }
 
 static bool channel_create_with_owner(const uint8_t name16[16], uint8_t owner_user_id, uint8_t *out_channel_id) {
@@ -517,6 +528,10 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
         if (st == UDB_OK) {
             req.user_id = alloc_uid();
             uidmap_set(req.user_id, req.username16);
+            
+            // Milestone 2 Feature: Auto-join on account creation
+            add_to_milestone2(req.user_id);
+
             return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, ST_OK, &req, sizeof(req));
         }
         return send_response_keepalive(client_fd, MSG_USER_CREATE_RES, udb_is_exists(st) ? ST_AlreadyExists : ST_InternalError, NULL, 0);
@@ -535,8 +550,14 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
             uid = alloc_uid(); uidmap_set(uid, req.username16);
         }
 
-        if (req.user_status == 1) client_set_fd(uid, client_fd);
-        else client_remove_fd(client_fd);
+        if (req.user_status == 1) {
+            client_set_fd(uid, client_fd);
+            
+            // Milestone 2 Feature: Auto-join if user logs back in
+            add_to_milestone2(uid);
+        } else {
+            client_remove_fd(client_fd);
+        }
 
         memset(req.password16, 0, 16); // secure response
         return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_OK, &req, sizeof(req));
@@ -630,7 +651,7 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
         if (ch_idx < 0) { pthread_mutex_unlock(&g_channels_mu); free(body); return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_NotFound, NULL, 0); }
 
         if (!channel_has_member_locked(&g_channels[ch_idx], sender_uid)) {
-            // Implicit Join since RFC says users SHOULD be members to send (Being tolerant)
+            // Implicit Join just in case the client circumvents auto-join
             if(!channel_add_member_locked(&g_channels[ch_idx], sender_uid)) {
                 pthread_mutex_unlock(&g_channels_mu); free(body); return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_NotChannelMember, NULL, 0);
             }
