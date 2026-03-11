@@ -8,7 +8,7 @@ sudo apt install libgdbm-dev
 
 Build DB test:
 
-cc -Iinclude -o db_test src/db_test.c src/user_db.c
+cc -Iinclude -o db_test src/db_test.c src/user_db.c -lgdbm -lgdbm_compat
 ./db_test
 
 Run:

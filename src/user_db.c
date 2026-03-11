@@ -37,7 +37,7 @@ udb_status_t user_db_open(user_db_t **out, const char *path) {
     user_db_t *db = (user_db_t *)calloc(1, sizeof(*db));
     if (!db) return UDB_ERR_IO;
 
-    db->dbm = dbm_open(path, O_RDWR | O_CREAT, 0644);
+    db->dbm = dbm_open((char *)path, O_RDWR | O_CREAT, 0644);
     if (!db->dbm) {
         free(db);
         return UDB_ERR_OPEN;
