@@ -15,6 +15,6 @@ testdb.db
 cmake-build-*/
 *.o
 *.a
-
+/build/
 
 
