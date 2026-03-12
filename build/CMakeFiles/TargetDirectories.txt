@@ -1,4 +1,0 @@
-/Users/ea/Documents/network_server_service/build/CMakeFiles/server_app.dir
-/Users/ea/Documents/network_server_service/build/CMakeFiles/db_test.dir
-/Users/ea/Documents/network_server_service/build/CMakeFiles/edit_cache.dir
-/Users/ea/Documents/network_server_service/build/CMakeFiles/rebuild_cache.dir

@@ -1,1 +1,0 @@
-/usr/bin/cc -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/server_app.dir/main.c.o CMakeFiles/server_app.dir/protocol.c.o CMakeFiles/server_app.dir/src/user_db.c.o -o server_app
