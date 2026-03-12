@@ -23,6 +23,7 @@ enum MsgType {
 };
 
 #pragma pack(push, 1)
+
 typedef struct {
     uint8_t  version;
     uint8_t  type;
@@ -56,15 +57,23 @@ typedef struct {
     uint8_t auth_password16[16];
 } BodyAuth32;
 
+/* Server now expects auth + channel_id */
 typedef struct {
     uint8_t auth_username16[16];
     uint8_t auth_password16[16];
-    uint8_t channel_name16[16];
+    uint8_t channel_id;
 } BodyChannelReadReq;
+
+typedef struct {
+    uint8_t channel_id;
+    uint8_t channel_name16[16];
+} ChannelListEntry17;
+
 #pragma pack(pop)
 
 static int read_exact(int fd, void *buf, size_t n) {
     size_t off = 0;
+
     while (off < n) {
         ssize_t r = read(fd, (uint8_t *)buf + off, n - off);
         if (r == 0) return 0;
@@ -74,11 +83,13 @@ static int read_exact(int fd, void *buf, size_t n) {
         }
         off += (size_t)r;
     }
+
     return 1;
 }
 
 static int write_exact(int fd, const void *buf, size_t n) {
     size_t off = 0;
+
     while (off < n) {
         ssize_t w = write(fd, (const uint8_t *)buf + off, n - off);
         if (w <= 0) {
@@ -87,6 +98,7 @@ static int write_exact(int fd, const void *buf, size_t n) {
         }
         off += (size_t)w;
     }
+
     return 0;
 }
 
@@ -95,10 +107,14 @@ static void fill16(uint8_t out[16], const char *s) {
     strncpy((char *)out, s, 15);
 }
 
+static void copy_name16_to_cstr(const uint8_t in[16], char out[17]) {
+    memcpy(out, in, 16);
+    out[16] = '\0';
+}
+
 static void print_name16(const uint8_t in[16]) {
     char s[17];
-    memcpy(s, in, 16);
-    s[16] = '\0';
+    copy_name16_to_cstr(in, s);
     printf("%s", s);
 }
 
@@ -131,6 +147,7 @@ static int connect_tcp(const char *ip, int port) {
 
 static int send_pdu(int fd, uint8_t type, const void *body, uint32_t body_len) {
     WireHeader h;
+
     h.version = PROTO_V2;
     h.type = type;
     h.status = 0;
@@ -138,9 +155,10 @@ static int send_pdu(int fd, uint8_t type, const void *body, uint32_t body_len) {
     h.size_be = htonl(body_len);
 
     if (write_exact(fd, &h, sizeof(h)) != 0) return -1;
-    if (body_len > 0 && body) {
+    if (body_len > 0 && body != NULL) {
         if (write_exact(fd, body, body_len) != 0) return -1;
     }
+
     return 0;
 }
 
@@ -155,6 +173,7 @@ static int recv_pdu(int fd, WireHeader *out_h, uint8_t **out_body) {
     if (blen > 0) {
         body = (uint8_t *)malloc(blen);
         if (!body) return -1;
+
         if (read_exact(fd, body, blen) <= 0) {
             free(body);
             return -1;
@@ -169,6 +188,39 @@ static int recv_pdu(int fd, WireHeader *out_h, uint8_t **out_body) {
 static void print_header(const WireHeader *h) {
     printf("RESP: ver=0x%02x type=0x%02x status=0x%02x body_len=%u\n",
            h->version, h->type, h->status, ntohl(h->size_be));
+}
+
+static uint8_t read_channels_list_and_pick_id(const uint8_t *body, uint32_t blen) {
+    if (body == NULL || blen < 33) return 0;
+
+    uint8_t count = body[32];
+    size_t off = 33;
+    uint8_t chosen_id = 0;
+
+    printf("Channels.Read OK: count=%u\n", count);
+
+    for (uint8_t i = 0; i < count; i++) {
+        if (off + sizeof(ChannelListEntry17) > blen) {
+            printf("Truncated channel list entry at index %u\n", i);
+            break;
+        }
+
+        ChannelListEntry17 entry;
+        char name[17];
+
+        memcpy(&entry, &body[off], sizeof(entry));
+        off += sizeof(entry);
+
+        copy_name16_to_cstr(entry.channel_name16, name);
+
+        printf("  Channel[%u]: id=%u name=%s\n", i, entry.channel_id, name);
+
+        if (chosen_id == 0) {
+            chosen_id = entry.channel_id;
+        }
+    }
+
+    return chosen_id;
 }
 
 int main(int argc, char **argv) {
@@ -190,6 +242,7 @@ int main(int argc, char **argv) {
 
     uint8_t created_user_id = 0;
     uint8_t created_channel_id = 0;
+    uint8_t chosen_channel_id = 0;
 
     /* --------------------------------------------------
        1) User.Create
@@ -218,11 +271,13 @@ int main(int argc, char **argv) {
 
         print_header(&h);
 
-        if (h.type == MSG_USER_CREATE_RES && h.status == 0x00 &&
+        if (h.type == MSG_USER_CREATE_RES &&
+            h.status == 0x00 &&
             ntohl(h.size_be) == sizeof(BodyUserCreate)) {
             BodyUserCreate res;
             memcpy(&res, body, sizeof(res));
             created_user_id = res.user_id;
+
             printf("User.Create OK: username=");
             print_name16(res.username16);
             printf(" user_id=%u\n", created_user_id);
@@ -247,8 +302,6 @@ int main(int argc, char **argv) {
         req.ipv4[1] = 0;
         req.ipv4[2] = 0;
         req.ipv4[3] = 1;
-
-        /* Tolerant server accepts 0 or 1. Use 1 for RFC online. */
         req.user_status = 1;
 
         printf("\nSEND User.Update LOGIN (0x14)\n");
@@ -268,7 +321,8 @@ int main(int argc, char **argv) {
 
         print_header(&h);
 
-        if (h.type == MSG_USER_UPDATE_RES && h.status == 0x00 &&
+        if (h.type == MSG_USER_UPDATE_RES &&
+            h.status == 0x00 &&
             ntohl(h.size_be) == sizeof(BodyUserUpdate)) {
             printf("Login OK\n");
         } else {
@@ -306,11 +360,13 @@ int main(int argc, char **argv) {
 
         print_header(&h);
 
-        if (h.type == MSG_CHANNEL_CREATE_RES && h.status == 0x00 &&
+        if (h.type == MSG_CHANNEL_CREATE_RES &&
+            h.status == 0x00 &&
             ntohl(h.size_be) == sizeof(BodyChannelCreate)) {
             BodyChannelCreate res;
             memcpy(&res, body, sizeof(res));
             created_channel_id = res.channel_id;
+
             printf("Channel.Create OK: channel_name=");
             print_name16(res.channel_name16);
             printf(" channel_id=%u\n", created_channel_id);
@@ -349,20 +405,21 @@ int main(int argc, char **argv) {
 
         print_header(&h);
 
-        if (h.type == MSG_CHANNELS_READ_RES && h.status == 0x00 && ntohl(h.size_be) >= 33) {
+        if (h.type == MSG_CHANNELS_READ_RES &&
+            h.status == 0x00 &&
+            ntohl(h.size_be) >= 33) {
             uint32_t blen = ntohl(h.size_be);
-            uint8_t count = body[32];
-            printf("Channels.Read OK: count=%u\n", count);
-            printf("Channel IDs: ");
-            for (uint8_t i = 0; i < count && (33u + i) < blen; i++) {
-                printf("%u ", body[33 + i]);
-            }
-            printf("\n");
+            chosen_channel_id = read_channels_list_and_pick_id(body, blen);
         } else {
             printf("Unexpected Channels.Read response.\n");
         }
 
         free(body);
+    }
+
+    /* Prefer the newly-created channel if available */
+    if (created_channel_id != 0) {
+        chosen_channel_id = created_channel_id;
     }
 
     /* --------------------------------------------------
@@ -373,9 +430,9 @@ int main(int argc, char **argv) {
         memset(&req, 0, sizeof(req));
         fill16(req.auth_username16, username);
         fill16(req.auth_password16, password);
-        fill16(req.channel_name16, channel_name);
+        req.channel_id = chosen_channel_id;
 
-        printf("\nSEND Channel.Read (0x22)\n");
+        printf("\nSEND Channel.Read (0x22) for channel_id=%u\n", req.channel_id);
         if (send_pdu(fd, MSG_CHANNEL_READ_REQ, &req, (uint32_t)sizeof(req)) != 0) {
             perror("send Channel.Read");
             close(fd);
@@ -392,14 +449,18 @@ int main(int argc, char **argv) {
 
         print_header(&h);
 
-        if (h.type == MSG_CHANNEL_READ_RES && h.status == 0x00 && ntohl(h.size_be) >= 50) {
+        if (h.type == MSG_CHANNEL_READ_RES &&
+            h.status == 0x00 &&
+            ntohl(h.size_be) >= 50) {
             uint32_t blen = ntohl(h.size_be);
             char chname[17];
+            uint8_t channel_id;
+            uint8_t member_count;
+
             memcpy(chname, &body[32], 16);
             chname[16] = '\0';
-
-            uint8_t channel_id = body[48];
-            uint8_t member_count = body[49];
+            channel_id = body[48];
+            member_count = body[49];
 
             printf("Channel.Read OK:\n");
             printf("  name=%s\n", chname);
@@ -426,6 +487,4 @@ int main(int argc, char **argv) {
 
     close(fd);
     return 0;
-}//
-// Created by Fereshteh on 3/10/26.
-//
+}
