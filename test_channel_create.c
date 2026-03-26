@@ -9,6 +9,12 @@
 
 enum { PROTO_V2 = 0x02 };
 
+enum {
+    ST_OK            = 0x00,
+    ST_AlreadyExists = 0x46,
+    ST_Forbidden     = 0x48
+};
+
 enum MsgType {
     MSG_USER_CREATE_REQ    = 0x10,
     MSG_USER_CREATE_RES    = 0x11,
@@ -57,17 +63,11 @@ typedef struct {
     uint8_t auth_password16[16];
 } BodyAuth32;
 
-/* Server now expects auth + channel_id */
 typedef struct {
     uint8_t auth_username16[16];
     uint8_t auth_password16[16];
     uint8_t channel_id;
 } BodyChannelReadReq;
-
-typedef struct {
-    uint8_t channel_id;
-    uint8_t channel_name16[16];
-} ChannelListEntry17;
 
 #pragma pack(pop)
 
@@ -190,33 +190,31 @@ static void print_header(const WireHeader *h) {
            h->version, h->type, h->status, ntohl(h->size_be));
 }
 
+/* New protocol.c returns:
+   body[0..31]  = zeroed auth area
+   body[32]     = count
+   body[33..]   = channel IDs only
+*/
 static uint8_t read_channels_list_and_pick_id(const uint8_t *body, uint32_t blen) {
     if (body == NULL || blen < 33) return 0;
 
     uint8_t count = body[32];
-    size_t off = 33;
     uint8_t chosen_id = 0;
 
     printf("Channels.Read OK: count=%u\n", count);
 
     for (uint8_t i = 0; i < count; i++) {
-        if (off + sizeof(ChannelListEntry17) > blen) {
-            printf("Truncated channel list entry at index %u\n", i);
+        uint32_t idx = 33u + i;
+        if (idx >= blen) {
+            printf("Truncated channel ID at index %u\n", i);
             break;
         }
 
-        ChannelListEntry17 entry;
-        char name[17];
-
-        memcpy(&entry, &body[off], sizeof(entry));
-        off += sizeof(entry);
-
-        copy_name16_to_cstr(entry.channel_name16, name);
-
-        printf("  Channel[%u]: id=%u name=%s\n", i, entry.channel_id, name);
+        uint8_t channel_id = body[idx];
+        printf("  Channel[%u]: id=%u\n", i, channel_id);
 
         if (chosen_id == 0) {
-            chosen_id = entry.channel_id;
+            chosen_id = channel_id;
         }
     }
 
@@ -241,7 +239,6 @@ int main(int argc, char **argv) {
     if (fd < 0) return 1;
 
     uint8_t created_user_id = 0;
-    uint8_t created_channel_id = 0;
     uint8_t chosen_channel_id = 0;
 
     /* --------------------------------------------------
@@ -272,7 +269,7 @@ int main(int argc, char **argv) {
         print_header(&h);
 
         if (h.type == MSG_USER_CREATE_RES &&
-            h.status == 0x00 &&
+            h.status == ST_OK &&
             ntohl(h.size_be) == sizeof(BodyUserCreate)) {
             BodyUserCreate res;
             memcpy(&res, body, sizeof(res));
@@ -281,7 +278,7 @@ int main(int argc, char **argv) {
             printf("User.Create OK: username=");
             print_name16(res.username16);
             printf(" user_id=%u\n", created_user_id);
-        } else if (h.type == MSG_USER_CREATE_RES && h.status == 0x46) {
+        } else if (h.type == MSG_USER_CREATE_RES && h.status == ST_AlreadyExists) {
             printf("User already exists. Continuing with login test.\n");
         } else {
             printf("Unexpected User.Create response.\n");
@@ -322,7 +319,7 @@ int main(int argc, char **argv) {
         print_header(&h);
 
         if (h.type == MSG_USER_UPDATE_RES &&
-            h.status == 0x00 &&
+            h.status == ST_OK &&
             ntohl(h.size_be) == sizeof(BodyUserUpdate)) {
             printf("Login OK\n");
         } else {
@@ -334,6 +331,7 @@ int main(int argc, char **argv) {
 
     /* --------------------------------------------------
        3) Channel.Create
+       New server returns ST_Forbidden
        -------------------------------------------------- */
     {
         BodyChannelCreate req;
@@ -361,17 +359,18 @@ int main(int argc, char **argv) {
         print_header(&h);
 
         if (h.type == MSG_CHANNEL_CREATE_RES &&
-            h.status == 0x00 &&
+            h.status == ST_OK &&
             ntohl(h.size_be) == sizeof(BodyChannelCreate)) {
             BodyChannelCreate res;
             memcpy(&res, body, sizeof(res));
-            created_channel_id = res.channel_id;
 
             printf("Channel.Create OK: channel_name=");
             print_name16(res.channel_name16);
-            printf(" channel_id=%u\n", created_channel_id);
-        } else if (h.type == MSG_CHANNEL_CREATE_RES && h.status == 0x46) {
+            printf(" channel_id=%u\n", res.channel_id);
+        } else if (h.type == MSG_CHANNEL_CREATE_RES && h.status == ST_AlreadyExists) {
             printf("Channel already exists.\n");
+        } else if (h.type == MSG_CHANNEL_CREATE_RES && h.status == ST_Forbidden) {
+            printf("Channel.Create forbidden by server. Continuing with existing/default channels.\n");
         } else {
             printf("Unexpected Channel.Create response.\n");
         }
@@ -406,7 +405,7 @@ int main(int argc, char **argv) {
         print_header(&h);
 
         if (h.type == MSG_CHANNELS_READ_RES &&
-            h.status == 0x00 &&
+            h.status == ST_OK &&
             ntohl(h.size_be) >= 33) {
             uint32_t blen = ntohl(h.size_be);
             chosen_channel_id = read_channels_list_and_pick_id(body, blen);
@@ -417,9 +416,10 @@ int main(int argc, char **argv) {
         free(body);
     }
 
-    /* Prefer the newly-created channel if available */
-    if (created_channel_id != 0) {
-        chosen_channel_id = created_channel_id;
+    if (chosen_channel_id == 0) {
+        printf("\nNo channel id available to read.\n");
+        close(fd);
+        return 1;
     }
 
     /* --------------------------------------------------
@@ -450,7 +450,7 @@ int main(int argc, char **argv) {
         print_header(&h);
 
         if (h.type == MSG_CHANNEL_READ_RES &&
-            h.status == 0x00 &&
+            h.status == ST_OK &&
             ntohl(h.size_be) >= 50) {
             uint32_t blen = ntohl(h.size_be);
             char chname[17];
@@ -473,10 +473,15 @@ int main(int argc, char **argv) {
             }
             printf("\n");
 
-            if (created_user_id != 0 && member_count > 0 && body[50] == created_user_id) {
-                printf("Creator membership check: PASS\n");
-            } else if (created_user_id != 0) {
-                printf("Creator membership check: could not confirm from first member slot\n");
+            if (created_user_id != 0) {
+                int found = 0;
+                for (uint8_t i = 0; i < member_count && (50u + i) < blen; i++) {
+                    if (body[50 + i] == created_user_id) {
+                        found = 1;
+                        break;
+                    }
+                }
+                printf("Creator membership check: %s\n", found ? "PASS" : "NOT FOUND");
             }
         } else {
             printf("Unexpected Channel.Read response.\n");
