@@ -16,5 +16,5 @@ cmake-build-*/
 *.o
 *.a
 /build/
-
+*/CMakeFiles/
 

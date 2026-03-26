@@ -120,16 +120,11 @@ typedef struct {
     uint8_t channel_id;
 } BodyChannelCreate;
 
-/* RFC v0.2 Channel Read:
- * Auth(32) + ChannelName(16) + ChannelId(1) + UserIdLen(1) + UserIds(variable)
- * minimum body size = 50 bytes
- */
+/* CHANNEL_READ now uses channel_id, not channel_name */
 typedef struct {
     uint8_t auth_username16[16];
     uint8_t auth_password16[16];
-    uint8_t channel_name16[16];
     uint8_t channel_id;
-    uint8_t user_id_len;
 } BodyChannelReadReq;
 
 typedef struct {
@@ -313,19 +308,7 @@ static void channels_init_once(void) {
     g_channels[0].member_count = 0;
     g_channels[0].owner_user_id = 0;
 
-    g_channels[1].in_use = true;
-    g_channels[1].channel_id = 2;
-    memcpy(g_channels[1].channel_name16, "general\0\0\0\0\0\0\0\0\0", 16);
-    g_channels[1].member_count = 0;
-    g_channels[1].owner_user_id = 0;
-
-    g_channels[2].in_use = true;
-    g_channels[2].channel_id = 3;
-    memcpy(g_channels[2].channel_name16, "random\0\0\0\0\0\0\0\0\0\0", 16);
-    g_channels[2].member_count = 0;
-    g_channels[2].owner_user_id = 0;
-
-    g_next_channel_id = 4;
+    g_next_channel_id = 2;
 }
 
 static void ensure_channels_initialized(void) {
@@ -573,8 +556,6 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
     /* ================= USER UPDATE (Login/Logout) ================= */
     if (h.type == MSG_USER_UPDATE_REQ) {
-        printf("ENTER USER_UPDATE handler: body_len=%u\n", body_len);
-        fflush(stdout);
         if (body_len != sizeof(BodyUserUpdate)) {
             free(body);
             return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidSize, NULL, 0);
@@ -584,15 +565,9 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
         memcpy(&req, body, sizeof(req));
         free(body);
 
-        printf("USER_UPDATE parsed: status=%u username=%.16s\n", req.user_status, req.username16);
-        fflush(stdout);
-
         if (!auth_ok16(db, req.username16, req.password16)) {
             return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_InvalidCreds, NULL, 0);
         }
-
-        printf("USER_UPDATE auth ok for %.16s\n", req.username16);
-        fflush(stdout);
 
         if (req.user_status > 1) {
             return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_MalformedRequest, NULL, 0);
@@ -606,11 +581,6 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
         if (req.user_status == 1) {
             client_set_fd(uid, client_fd);
-            printf("REGISTER FD: uid=%u fd=%d\n", uid, client_fd);
-            fflush(stdout);
-
-            printf("LOGIN username=%.16s uid=%u fd=%d\n", req.username16, uid, client_fd);
-            fflush(stdout);
 
             pthread_mutex_lock(&g_channels_mu);
             channel_add_member_locked(&g_channels[0], uid);
@@ -656,89 +626,48 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
     /* ================= CHANNEL READ ================= */
     if (h.type == MSG_CHANNEL_READ_REQ) {
-        if (body_len < sizeof(BodyChannelReadReq)) {
+        if (body_len != sizeof(BodyChannelReadReq)) {
             free(body);
             return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidSize, NULL, 0);
         }
 
         BodyChannelReadReq req;
         memcpy(&req, body, sizeof(req));
-
-        if (body_len != (uint32_t)sizeof(BodyChannelReadReq) + req.user_id_len) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidSize, NULL, 0);
-        }
+        free(body);
 
         if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
-            free(body);
             return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InvalidCreds, NULL, 0);
-        }
-
-        uint8_t uid = 0;
-        if (!uidmap_find_by_username(req.auth_username16, &uid)) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InternalError, NULL, 0);
         }
 
         pthread_mutex_lock(&g_channels_mu);
 
         int ch_idx = -1;
-
-        /* Prefer channel_id if present */
-        if (req.channel_id != 0) {
-            for (int i = 0; i < MAX_CHANNELS; i++) {
-                if (g_channels[i].in_use && g_channels[i].channel_id == req.channel_id) {
-                    ch_idx = i;
-                    break;
-                }
-            }
-        }
-
-        /* Fall back to channel_name16 */
-        if (ch_idx < 0) {
-            for (int i = 0; i < MAX_CHANNELS; i++) {
-                if (g_channels[i].in_use &&
-                    memcmp(g_channels[i].channel_name16, req.channel_name16, 16) == 0) {
-                    ch_idx = i;
-                    break;
-                }
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            if (g_channels[i].in_use && g_channels[i].channel_id == req.channel_id) {
+                ch_idx = i;
+                break;
             }
         }
 
         if (ch_idx < 0) {
             pthread_mutex_unlock(&g_channels_mu);
-            free(body);
             return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_NotFound, NULL, 0);
-        }
-
-        if (!channel_has_member_locked(&g_channels[ch_idx], uid)) {
-            if (!channel_add_member_locked(&g_channels[ch_idx], uid)) {
-                pthread_mutex_unlock(&g_channels_mu);
-                free(body);
-                return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_ResourceExhausted, NULL, 0);
-            }
-
-            printf("JOIN: uid=%u -> channel=%u\n", uid, g_channels[ch_idx].channel_id);
-            fflush(stdout);
         }
 
         Channel ch = g_channels[ch_idx];
         pthread_mutex_unlock(&g_channels_mu);
-        free(body);
 
-        uint32_t resp_len = (uint32_t)sizeof(BodyChannelReadReq) + ch.member_count;
+        uint32_t resp_len = 32 + 16 + 1 + 1 + ch.member_count;
         uint8_t *resp = (uint8_t *)calloc(1, resp_len);
         if (!resp) {
             return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_ResourceExhausted, NULL, 0);
         }
 
-        /* auth area remains zeroed */
+        /* first 32 bytes: zeroed auth area */
         memcpy(resp + 32, ch.channel_name16, 16);
         resp[48] = ch.channel_id;
         resp[49] = ch.member_count;
-        if (ch.member_count > 0) {
-            memcpy(resp + 50, ch.member_ids, ch.member_count);
-        }
+        memcpy(resp + 50, ch.member_ids, ch.member_count);
 
         int ret = send_response_raw(client_fd, MSG_CHANNEL_READ_RES, ST_OK, resp, resp_len);
         free(resp);
@@ -747,28 +676,21 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
     /* ================= CHANNELS READ ================= */
     if (h.type == MSG_CHANNELS_READ_REQ) {
-        if (body_len < sizeof(BodyChannelsReadReq33)) {
+        if (body_len < sizeof(BodyAuth32)) {
             free(body);
             return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
         }
 
-        BodyChannelsReadReq33 req;
-        memcpy(&req, body, sizeof(req));
+        BodyAuth32 auth;
+        memcpy(&auth, body, sizeof(auth));
+        free(body);
 
-        if (body_len != (uint32_t)sizeof(BodyChannelsReadReq33) + req.channel_id_len) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
-        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
-            free(body);
+        if (!auth_ok16(db, auth.auth_username16, auth.auth_password16)) {
             return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_InvalidCreds, NULL, 0);
         }
 
-        free(body);
-
         uint8_t out[32 + 1 + 255];
-        memset(out, 0, sizeof(out));
+        memset(out, 0, 32);
         out[32] = channels_collect_ids(&out[33]);
 
         return send_response_keepalive(client_fd, MSG_CHANNELS_READ_RES, ST_OK, out, 33 + out[32]);
@@ -872,17 +794,6 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
         read_body[43] = sender_uid;
         memcpy(read_body + 44, body + 43, msg_len);
 
-        printf("Broadcast from uid=%u to channel=%u member_count=%u\n",
-               sender_uid, req.channel_id, g_channels[ch_idx].member_count);
-
-        pthread_mutex_lock(&g_clients_mu);
-        for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
-            uint8_t muid = g_channels[ch_idx].member_ids[i];
-            int mfd = client_get_fd(muid);
-            printf(" -> uid=%u fd=%d\n", muid, mfd);
-        }
-        fflush(stdout);
-
         for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
             int mem_fd = client_get_fd(g_channels[ch_idx].member_ids[i]);
             if (mem_fd >= 0) {
@@ -905,13 +816,6 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 
         BodyMessageReadRes req;
         memcpy(&req, body, sizeof(req));
-
-        uint16_t msg_len = ntohs(req.message_len);
-        if (body_len != sizeof(req) + msg_len) {
-            free(body);
-            return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_InvalidSize, NULL, 0);
-        }
-
         free(body);
 
         if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
@@ -961,14 +865,10 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
 }
 
 void protocol_handle_client(int client_fd, user_db_t *db) {
-    printf("CLIENT handler started (fd=%d)\n", client_fd);  // optional, for clarity
     while (1) {
         int rc = protocol_handle_one(client_fd, db);
         if (rc <= 0) break;
     }
-
-    printf("REMOVE FD: fd=%d\n", client_fd);
-    fflush(stdout);
     client_remove_fd(client_fd);
     close(client_fd);
 }
