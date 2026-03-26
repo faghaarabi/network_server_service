@@ -1,0 +1,8 @@
+Connected to manager 192.168.0.36:42069
+Sent SERVER_REG_REQ to manager (ver=0x02 reg_ip=127.0.0.1 id=1)
+DEBUG: Attempting to bind and listen on 0.0.0.0:42069
+SUCCESS: Listening for clients on 0.0.0.0:42069. (Run 'lsof -iTCP:42069 -sTCP:LISTEN' to verify)
+[SERVER] waiting in accept()...
+[MANAGER] msg: ver=0x02 type=0x01 status=0 body_len=5
+[MANAGER] body: ip=127.0.0.1 id=1
+[MANAGER] assigned server_id=1

@@ -342,7 +342,7 @@ int main(int argc, char **argv) {
     int LISTEN_PORT = get_int_arg(argc, argv, "--listen-port", 42069);
 
     const char *MGR_IP = get_arg(argc, argv, "--mgr-ip");
-    if (!MGR_IP) MGR_IP = "192.168.0.33";
+    if (!MGR_IP) MGR_IP = "192.168.0.45";
     int MGR_PORT = get_int_arg(argc, argv, "--mgr-port", 42069);
 
     int server_id_int = get_int_arg(argc, argv, "--server-id", 1);
