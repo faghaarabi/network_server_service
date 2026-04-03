@@ -11,7 +11,9 @@
 #include <stdbool.h>
 #include <pthread.h>
 
+
 #include "user_db.h"
+#include "message_db.h"
 
 static pthread_mutex_t g_db_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -505,7 +507,7 @@ static uint8_t *build_message_read_body(const uint8_t username16[16],
     if (out_len) *out_len = total;
     printf("DEBUG BUILD:\n");
     printf("  total size = %u\n", total);
-    printf("  timestamp = %lu\n", timestamp_host);
+    printf("  timestamp = %llu\n", (unsigned long long)timestamp_host);
     printf("  msg_len = %u\n", msg_len_host);
     printf("  channel_id = %u\n", channel_id);
     printf("  sender_id = %u\n", sender_id);
@@ -513,7 +515,8 @@ static uint8_t *build_message_read_body(const uint8_t username16[16],
     return buf;
 }
 
-int protocol_handle_one(int client_fd, user_db_t *db) {
+int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
+    (void)msg_db;
     WireHeader h;
     int rr = read_exact(client_fd, &h, sizeof(h));
     if (rr <= 0) return rr;
@@ -1029,9 +1032,9 @@ int protocol_handle_one(int client_fd, user_db_t *db) {
     return send_response_keepalive(client_fd, resp_type, ST_InvalidType, NULL, 0);
 }
 
-void protocol_handle_client(int client_fd, user_db_t *db) {
+void protocol_handle_client(int client_fd, user_db_t *db, message_db_t *msg_db) {
     while (1) {
-        int rc = protocol_handle_one(client_fd, db);
+        int rc = protocol_handle_one(client_fd, db, msg_db);
         if (rc <= 0) break;
     }
     client_remove_fd(client_fd);

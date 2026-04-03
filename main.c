@@ -32,7 +32,9 @@
 #include "user_db.h"
 
 /* Provided elsewhere (e.g., protocol.c). Must close(client_fd) inside. */
-void protocol_handle_client(int client_fd, user_db_t *db);
+#include "message_db.h"
+
+void protocol_handle_client(int client_fd, user_db_t *user_db, message_db_t *msg_db);
 
 /* BIG v0.2 */
 enum { PROTO_V2 = 0x02 };
@@ -78,6 +80,7 @@ typedef struct {
 typedef struct {
     int client_fd;
     user_db_t *db;
+    message_db_t *msg_db;
     uint64_t client_id;
 } client_thread_args_t;
 
@@ -325,7 +328,7 @@ static void *client_worker(void *arg) {
     printf("[CLIENT %" PRIu64 "] handler started (fd=%d)\n", args->client_id, args->client_fd);
 
     /* protocol_handle_client() must close(client_fd) */
-    protocol_handle_client(args->client_fd, args->db);
+    protocol_handle_client(args->client_fd, args->db, args->msg_db);
 
     printf("[CLIENT %" PRIu64 "] handler finished (fd=%d)\n", args->client_id, args->client_fd);
 
@@ -356,6 +359,12 @@ int main(int argc, char **argv) {
     user_db_t *db = NULL;
     if (user_db_open(&db, DB_PATH) != 0) {
         fprintf(stderr, "Failed to open DB: %s\n", DB_PATH);
+        return 1;
+    }
+
+    message_db_t *msg_db = NULL;
+    if (message_db_open(&msg_db, "db/messages.db") != MDB_OK) {
+        fprintf(stderr, "Failed to open message DB: db/messages.db\n");
         return 1;
     }
 
@@ -448,8 +457,10 @@ int main(int argc, char **argv) {
             close(c);
             continue;
         }
+
         args->client_fd = c;
         args->db = db;
+        args->msg_db = msg_db;
         args->client_id = my_id;
 
         pthread_t client_tid;
