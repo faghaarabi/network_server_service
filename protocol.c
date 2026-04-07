@@ -11,13 +11,11 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-
 #include "user_db.h"
 #include "message_db.h"
 
 static pthread_mutex_t g_db_mu = PTHREAD_MUTEX_INITIALIZER;
-
-
+static pthread_mutex_t g_msg_db_mu = PTHREAD_MUTEX_INITIALIZER;
 
 enum { PROTO_V2 = 0x02 };
 
@@ -69,7 +67,8 @@ enum MsgType {
     MSG_CHANNEL_READ_REQ    = 0x22, MSG_CHANNEL_READ_RES    = 0x23,
     MSG_CHANNELS_READ_REQ   = 0x2A, MSG_CHANNELS_READ_RES   = 0x2B,
     MSG_MESSAGE_CREATE_REQ  = 0x30, MSG_MESSAGE_CREATE_RES  = 0x31,
-    MSG_MESSAGE_READ_REQ    = 0x32, MSG_MESSAGE_READ_RES    = 0x33
+    MSG_MESSAGE_READ_REQ    = 0x32, MSG_MESSAGE_READ_RES    = 0x33,
+    MSG_USER_DELETE_REQ     = 0x16, MSG_USER_DELETE_RES     = 0x17
 };
 
 /* Compatibility aliases */
@@ -106,6 +105,11 @@ typedef struct {
 typedef struct {
     uint8_t username16[16];
     uint8_t password16[16];
+} BodyUserDelete;
+
+typedef struct {
+    uint8_t username16[16];
+    uint8_t password16[16];
     uint8_t ipv4[4];
     uint8_t user_status;
 } BodyUserUpdate;
@@ -119,8 +123,6 @@ typedef struct {
     uint8_t username16[16];
     uint8_t target_user_id;
 } BodyUserRead;
-
-
 
 typedef struct {
     uint8_t auth_username16[16];
@@ -193,7 +195,6 @@ static uint64_t my_ntohll(uint64_t val) {
 
 #define MAX_CHANNELS 32
 #define MAX_CHANNEL_MEMBERS 255
-#define MAX_HISTORY 256
 #define MAX_STORED_MESSAGE 1024
 
 typedef struct {
@@ -205,16 +206,6 @@ typedef struct {
     uint8_t owner_user_id;
 } Channel;
 
-typedef struct {
-    uint64_t timestamp;
-    uint16_t msg_len;
-    uint8_t channel_id;
-    uint8_t sender_id;
-    uint8_t sender_username16[16];
-    uint8_t sender_password16[16];
-    uint8_t msg[MAX_STORED_MESSAGE];
-} HistoricalMsg;
-
 static pthread_mutex_t g_channels_mu = PTHREAD_MUTEX_INITIALIZER;
 static Channel g_channels[MAX_CHANNELS];
 static uint8_t g_next_channel_id = 1;
@@ -223,11 +214,6 @@ static pthread_once_t g_channels_once = PTHREAD_ONCE_INIT;
 /* Client connection registry for broadcasting messages */
 static int g_client_fds[256];
 static pthread_mutex_t g_clients_mu = PTHREAD_MUTEX_INITIALIZER;
-
-/* Message history */
-static HistoricalMsg g_msg_history[MAX_HISTORY];
-static int g_msg_hist_head = -1;
-static pthread_mutex_t g_msg_hist_mu = PTHREAD_MUTEX_INITIALIZER;
 
 /* ---------- UID allocator + UID->Username mapping ---------- */
 static pthread_mutex_t g_uid_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -290,7 +276,6 @@ static bool uidmap_get(uint8_t uid, uint8_t out_username16[16]) {
     return ok;
 }
 
-
 static bool uidmap_find_by_username(const uint8_t username16[16], uint8_t *out_uid) {
     pthread_mutex_lock(&g_uidmap_mu);
     for (int i = 1; i < 256; i++) {
@@ -321,7 +306,6 @@ static bool active_get(Body5 *out) {
 
 static void channels_init_once(void) {
     memset(g_channels, 0, sizeof(g_channels));
-    memset(g_msg_history, 0, sizeof(g_msg_history));
     memset(g_uid_present, 0, sizeof(g_uid_present));
     memset(g_uid_username16, 0, sizeof(g_uid_username16));
     for (int i = 0; i < 256; i++) g_client_fds[i] = -1;
@@ -345,7 +329,6 @@ static void channels_init_once(void) {
     g_channels[2].owner_user_id = 0;
 
     g_next_channel_id = 4;
-    g_msg_hist_head = -1;
 }
 
 static void ensure_channels_initialized(void) {
@@ -423,7 +406,7 @@ static bool is_valid_type_combo(uint8_t type) {
         case RES_ACTIVATEDSERVER:
             return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_DELETE);
         case RES_USER:
-            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE);
+            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE) || (a == CRUD_DELETE);
         case RES_LOG:
             return (a == CRUD_CREATE);
         case RES_CHANNEL:
@@ -467,6 +450,38 @@ static bool auth_ok16(user_db_t *db, const uint8_t username16[16], const uint8_t
     return ok;
 }
 
+static void uidmap_clear(uint8_t uid) {
+    if (uid == 0) return;
+    pthread_mutex_lock(&g_uidmap_mu);
+    g_uid_present[uid] = false;
+    memset(g_uid_username16[uid], 0, 16);
+    pthread_mutex_unlock(&g_uidmap_mu);
+}
+
+static void channel_remove_member_locked(Channel *ch, uint8_t user_id) {
+    if (!ch || user_id == 0) return;
+
+    for (uint8_t i = 0; i < ch->member_count; i++) {
+        if (ch->member_ids[i] == user_id) {
+            for (uint8_t j = i; j + 1 < ch->member_count; j++) {
+                ch->member_ids[j] = ch->member_ids[j + 1];
+            }
+            ch->member_count--;
+            return;
+        }
+    }
+}
+
+static void remove_user_from_all_channels(uint8_t user_id) {
+    pthread_mutex_lock(&g_channels_mu);
+    for (int i = 0; i < MAX_CHANNELS; i++) {
+        if (g_channels[i].in_use) {
+            channel_remove_member_locked(&g_channels[i], user_id);
+        }
+    }
+    pthread_mutex_unlock(&g_channels_mu);
+}
+
 static int send_response_raw(int fd, uint8_t type, uint8_t status, const void *body, uint32_t body_len) {
     WireHeader h = { PROTO_V2, type, status, 0, htonl(body_len) };
     if (write_exact(fd, &h, sizeof(h)) < 0) return -1;
@@ -480,8 +495,8 @@ static int send_response_keepalive(int fd, uint8_t type, uint8_t status, const v
     return (send_response_raw(fd, type, status, body, body_len) < 0) ? -1 : 1;
 }
 
-static uint8_t *build_message_read_body(const uint8_t username16[16],
-                                        const uint8_t password16[16],
+static uint8_t *build_message_read_body(const uint8_t auth_username16[16],
+                                        const uint8_t auth_password16[16],
                                         uint64_t timestamp_host,
                                         uint16_t msg_len_host,
                                         uint8_t channel_id,
@@ -493,8 +508,8 @@ static uint8_t *build_message_read_body(const uint8_t username16[16],
     if (!buf) return NULL;
 
     BodyMessageReadPrefix *p = (BodyMessageReadPrefix *)buf;
-    memcpy(p->auth_username16, username16, 16);
-    memcpy(p->auth_password16, password16, 16);
+    memcpy(p->auth_username16, auth_username16, 16);
+    memcpy(p->auth_password16, auth_password16, 16);
     p->timestamp = my_htonll(timestamp_host);
     p->message_len = htons(msg_len_host);
     p->channel_id = channel_id;
@@ -505,18 +520,21 @@ static uint8_t *build_message_read_body(const uint8_t username16[16],
     }
 
     if (out_len) *out_len = total;
-    printf("DEBUG BUILD:\n");
-    printf("  total size = %u\n", total);
-    printf("  timestamp = %llu\n", (unsigned long long)timestamp_host);
-    printf("  msg_len = %u\n", msg_len_host);
-    printf("  channel_id = %u\n", channel_id);
-    printf("  sender_id = %u\n", sender_id);
-    fflush(stdout);
     return buf;
 }
 
-int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
-    (void)msg_db;
+static int compare_message_records(const void *a, const void *b) {
+    const message_record_t *ma = (const message_record_t *)a;
+    const message_record_t *mb = (const message_record_t *)b;
+
+    if (ma->timestamp < mb->timestamp) return -1;
+    if (ma->timestamp > mb->timestamp) return 1;
+    if (ma->sender_id < mb->sender_id) return -1;
+    if (ma->sender_id > mb->sender_id) return 1;
+    return 0;
+}
+
+int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
     WireHeader h;
     int rr = read_exact(client_fd, &h, sizeof(h));
     if (rr <= 0) return rr;
@@ -653,8 +671,6 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
 
         if (req.user_status == 1) {
             client_set_fd(uid, client_fd);
-            printf("LOGIN username=%.16s uid=%u fd=%d\n", req.username16, uid, client_fd);
-            fflush(stdout);
 
             pthread_mutex_lock(&g_channels_mu);
             channel_add_member_locked(&g_channels[0], uid);
@@ -664,6 +680,49 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
         }
 
         return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_OK, &req, sizeof(req));
+    }
+
+    /* ================= USER DELETE ================= */
+    if (h.type == MSG_USER_DELETE_REQ) {
+        if (body_len != sizeof(BodyUserDelete)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        BodyUserDelete req;
+        memcpy(&req, body, sizeof(req));
+        free(body);
+
+        if (!auth_ok16(db, req.username16, req.password16)) {
+            return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InvalidCreds, NULL, 0);
+        }
+
+        char key[17];
+        username16_to_key(req.username16, key);
+
+        uint8_t uid = 0;
+        uidmap_find_by_username(req.username16, &uid);
+
+        pthread_mutex_lock(&g_db_mu);
+        udb_status_t st = user_db_del(db, key);
+        pthread_mutex_unlock(&g_db_mu);
+
+        if (st == UDB_ERR_NOTFOUND) {
+            return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_NotFound, NULL, 0);
+        }
+
+        if (st != UDB_OK) {
+            return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InternalError, NULL, 0);
+        }
+
+        if (uid != 0) {
+            remove_user_from_all_channels(uid);
+            uidmap_clear(uid);
+        }
+
+        client_remove_fd(client_fd);
+
+        return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_OK, &req, sizeof(req));
     }
 
     /* ================= USER READ ================= */
@@ -763,9 +822,6 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
                 free(body);
                 return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_ResourceExhausted, NULL, 0);
             }
-
-            printf("JOIN: uid=%u -> channel=%u\n", uid, g_channels[ch_idx].channel_id);
-            fflush(stdout);
         }
 
         Channel ch = g_channels[ch_idx];
@@ -791,7 +847,50 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
 
         int ret = send_response_raw(client_fd, MSG_CHANNEL_READ_RES, ST_OK, resp, resp_len);
         free(resp);
-        return ret < 0 ? -1 : 1;
+        if (ret < 0) return -1;
+
+        message_record_t *items = NULL;
+        size_t item_count = 0;
+
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t lst = message_db_load_channel(msg_db, ch.channel_id, &items, &item_count);
+        pthread_mutex_unlock(&g_msg_db_mu);
+
+        if (lst == MDB_OK && item_count > 0) {
+            qsort(items, item_count, sizeof(message_record_t), compare_message_records);
+
+            for (size_t i = 0; i < item_count; i++) {
+                uint32_t hist_len = 0;
+                uint8_t *hist_body = build_message_read_body(
+                    req.auth_username16,
+                    req.auth_password16,
+                    items[i].timestamp,
+                    items[i].msg_len,
+                    ch.channel_id,
+                    items[i].sender_id,
+                    items[i].msg,
+                    &hist_len
+                );
+
+                if (!hist_body) {
+                    message_db_free_records(items, item_count);
+                    return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_ResourceExhausted, NULL, 0);
+                }
+
+                if (send_response_raw(client_fd, MSG_MESSAGE_READ_RES, ST_OK, hist_body, hist_len) < 0) {
+                    free(hist_body);
+                    message_db_free_records(items, item_count);
+                    return -1;
+                }
+
+                free(hist_body);
+            }
+        } else if (lst != MDB_OK && lst != MDB_ERR_NOTFOUND) {
+            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InternalError, NULL, 0);
+        }
+
+        message_db_free_records(items, item_count);
+        return 1;
     }
 
     /* ================= CHANNELS READ ================= */
@@ -889,27 +988,28 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
         const uint8_t *msg_ptr = body + sizeof(BodyMessageCreateReqPrefix);
         uint16_t stored_len = (msg_len > MAX_STORED_MESSAGE) ? MAX_STORED_MESSAGE : msg_len;
 
-        pthread_mutex_lock(&g_msg_hist_mu);
-        for (int i = 0; i < MAX_HISTORY; i++) {
-            if (g_msg_history[i].channel_id == req.channel_id &&
-                g_msg_history[i].sender_id == sender_uid &&
-                g_msg_history[i].timestamp == ts) {
-                pthread_mutex_unlock(&g_msg_hist_mu);
-                pthread_mutex_unlock(&g_channels_mu);
-                free(body);
-                return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_AlreadyExists, NULL, 0);
-            }
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t mst = message_db_put(msg_db,
+                                          req.channel_id,
+                                          ts,
+                                          sender_uid,
+                                          req.auth_username16,
+                                          msg_ptr,
+                                          stored_len,
+                                          false);
+        pthread_mutex_unlock(&g_msg_db_mu);
+
+        if (mst == MDB_ERR_EXISTS) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_AlreadyExists, NULL, 0);
         }
 
-        g_msg_hist_head = (g_msg_hist_head + 1) % MAX_HISTORY;
-        g_msg_history[g_msg_hist_head].channel_id = req.channel_id;
-        g_msg_history[g_msg_hist_head].sender_id = sender_uid;
-        g_msg_history[g_msg_hist_head].timestamp = ts;
-        g_msg_history[g_msg_hist_head].msg_len = stored_len;
-        memcpy(g_msg_history[g_msg_hist_head].sender_username16, req.auth_username16, 16);
-        memcpy(g_msg_history[g_msg_hist_head].sender_password16, req.auth_password16, 16);
-        memcpy(g_msg_history[g_msg_hist_head].msg, msg_ptr, stored_len);
-        pthread_mutex_unlock(&g_msg_hist_mu);
+        if (mst != MDB_OK) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_InternalError, NULL, 0);
+        }
 
         int ack_ret = send_response_raw(client_fd, MSG_MESSAGE_CREATE_RES, ST_OK, body, body_len);
 
@@ -917,49 +1017,25 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
         uint8_t *read_body = build_message_read_body(req.auth_username16,
                                                      req.auth_password16,
                                                      ts,
-                                                     msg_len,
+                                                     stored_len,
                                                      req.channel_id,
                                                      sender_uid,
                                                      msg_ptr,
                                                      &read_len);
 
         if (!read_body) {
-            printf("DEBUG: build_message_read_body FAILED\n");
-            fflush(stdout);
             pthread_mutex_unlock(&g_channels_mu);
             free(body);
             return ack_ret < 0 ? -1 : 1;
         }
 
-        printf("DEBUG: build_message_read_body done\n");
-        printf("DEBUG: read_len = %u\n", read_len);
-        printf("DEBUG: msg_len = %u\n", msg_len);
-        printf("DEBUG: sender_uid = %u\n", sender_uid);
-        printf("DEBUG: channel_id = %u\n", req.channel_id);
-        fflush(stdout);
-
-        printf("Broadcast from uid=%u to channel=%u member_count=%u\n",
-               sender_uid, req.channel_id, g_channels[ch_idx].member_count);
-        printf("DEBUG: broadcasting to %u members\n", g_channels[ch_idx].member_count);
-
-        for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
-            uint8_t muid = g_channels[ch_idx].member_ids[i];
-            int mfd = client_get_fd(muid);
-            printf(" -> uid=%u fd=%d\n", muid, mfd);
-        }
-        fflush(stdout);
-
         for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
             uint8_t muid = g_channels[ch_idx].member_ids[i];
             int mem_fd = client_get_fd(muid);
             if (mem_fd >= 0) {
-                printf("DEBUG: actually sending to uid=%u fd=%d\n", muid, mem_fd);
-                int sret = send_response_raw(mem_fd, MSG_MESSAGE_READ_RES, ST_OK, read_body, read_len);
-                printf("DEBUG: send_response_raw to fd=%d returned %d\n", mem_fd, sret);
+                (void)send_response_raw(mem_fd, MSG_MESSAGE_READ_RES, ST_OK, read_body, read_len);
             }
         }
-        fflush(stdout);
-
 
         free(read_body);
         pthread_mutex_unlock(&g_channels_mu);
@@ -990,35 +1066,41 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db)  {
         }
 
         uint64_t target_ts = my_ntohll(req.timestamp);
+        uint8_t sender_username16[16];
+        uint8_t *msg_buf = NULL;
+        uint16_t msg_buf_len = 0;
 
-        pthread_mutex_lock(&g_msg_hist_mu);
-        bool found = false;
-        HistoricalMsg m;
-        memset(&m, 0, sizeof(m));
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t gst = message_db_get(msg_db,
+                                          req.channel_id,
+                                          target_ts,
+                                          req.sender_id,
+                                          sender_username16,
+                                          &msg_buf,
+                                          &msg_buf_len);
+        pthread_mutex_unlock(&g_msg_db_mu);
 
-        for (int i = 0; i < MAX_HISTORY; i++) {
-            if (g_msg_history[i].channel_id == req.channel_id &&
-                g_msg_history[i].timestamp == target_ts) {
-                m = g_msg_history[i];
-                found = true;
-                break;
-            }
-        }
-        pthread_mutex_unlock(&g_msg_hist_mu);
-
-        if (!found) {
+        if (gst == MDB_ERR_NOTFOUND) {
             return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_NotFound, NULL, 0);
         }
 
+        if (gst != MDB_OK) {
+            free(msg_buf);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_InternalError, NULL, 0);
+        }
+
         uint32_t rlen = 0;
-        uint8_t *rbody = build_message_read_body(m.sender_username16,
-                                                 m.sender_password16,
-                                                 m.timestamp,
-                                                 m.msg_len,
-                                                 m.channel_id,
-                                                 m.sender_id,
-                                                 m.msg,
+        uint8_t *rbody = build_message_read_body(req.auth_username16,
+                                                 req.auth_password16,
+                                                 target_ts,
+                                                 msg_buf_len,
+                                                 req.channel_id,
+                                                 req.sender_id,
+                                                 msg_buf,
                                                  &rlen);
+
+        free(msg_buf);
+
         if (!rbody) {
             return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_ResourceExhausted, NULL, 0);
         }
@@ -1039,6 +1121,4 @@ void protocol_handle_client(int client_fd, user_db_t *db, message_db_t *msg_db) 
     }
     client_remove_fd(client_fd);
     close(client_fd);
-    printf("SIZE CHECK:\n");
-    printf("sizeof(BodyMessageReadPrefix) = %lu\n", sizeof(BodyMessageReadPrefix));
 }
