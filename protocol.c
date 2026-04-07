@@ -539,6 +539,9 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
     int rr = read_exact(client_fd, &h, sizeof(h));
     if (rr <= 0) return rr;
 
+    printf("Received type = 0x%02x, body_len = %u\n", h.type, ntohl(h.size_be));
+
+
     uint8_t resp_type = make_resp_type(h.type);
 
     if (h.version != PROTO_V2) {
@@ -684,7 +687,10 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
 
     /* ================= USER DELETE ================= */
     if (h.type == MSG_USER_DELETE_REQ) {
+        printf("DELETE ACCOUNT request received\n");
+
         if (body_len != sizeof(BodyUserDelete)) {
+            printf("DELETE: invalid body size: %u\n", body_len);
             free(body);
             return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InvalidSize, NULL, 0);
         }
@@ -693,38 +699,51 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         memcpy(&req, body, sizeof(req));
         free(body);
 
+        printf("DELETE: body copied\n");
+
         if (!auth_ok16(db, req.username16, req.password16)) {
+            printf("DELETE: auth failed\n");
             return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InvalidCreds, NULL, 0);
         }
 
+        printf("DELETE: auth passed\n");
+
         char key[17];
         username16_to_key(req.username16, key);
+        printf("DELETE: key = %s\n", key);
 
         uint8_t uid = 0;
         uidmap_find_by_username(req.username16, &uid);
+        printf("DELETE: uid = %u\n", uid);
 
         pthread_mutex_lock(&g_db_mu);
         udb_status_t st = user_db_del(db, key);
         pthread_mutex_unlock(&g_db_mu);
 
+        printf("DELETE: user_db_del status = %d\n", st);
+
         if (st == UDB_ERR_NOTFOUND) {
+            printf("DELETE: user not found in DB\n");
             return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_NotFound, NULL, 0);
         }
 
         if (st != UDB_OK) {
+            printf("DELETE: internal delete error\n");
             return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_InternalError, NULL, 0);
         }
 
         if (uid != 0) {
+            printf("DELETE: removing user from channels and uid map\n");
             remove_user_from_all_channels(uid);
             uidmap_clear(uid);
         }
 
+        printf("DELETE: removing client fd\n");
         client_remove_fd(client_fd);
 
+        printf("DELETE: sending success response\n");
         return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_OK, &req, sizeof(req));
     }
-
     /* ================= USER READ ================= */
     if (h.type == MSG_USER_READ_REQ) {
         if (body_len != sizeof(BodyUserRead)) {
