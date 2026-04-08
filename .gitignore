@@ -17,4 +17,4 @@ cmake-build-*/
 *.a
 /build/
 */CMakeFiles/
-
+CMakeConfigureLog.yaml

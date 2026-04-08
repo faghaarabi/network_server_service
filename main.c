@@ -1,16 +1,12 @@
 /*
  * server_app.c
  *
- * Demo run:
- * ./server_app --listen-ip 0.0.0.0 --listen-port 42069 \
- *   --mgr-ip 192.168.0.131 --mgr-port 42069 \
- *   --server-id 1 --db /db/users.db --reg-ip 192.168.0.121
- *
- * Updates (RFC v0.2 + compat-safe):
+ * Updates (RFC v0.3 + compat-safe):
+ * - Upgraded base version to 0x03.
  * - Uses RFC manager heartbeat: Server.Update 0x04 -> 0x05 (5-byte body).
  * - Accepts BOTH manager heartbeat styles and ACKs them:
- *     * Old: 0x08 -> 0x09 (ActivatedServer.Create)
- *     * RFC: 0x04 -> 0x05 (Server.Update)
+ * * Old: 0x08 -> 0x09 (ActivatedServer.Create)
+ * * RFC: 0x04 -> 0x05 (Server.Update)
  * - If manager responds to registration with a ServerId, we store it and use it for heartbeats.
  * - DOES NOT change client accept/thread behavior (so login/logout and client protocol stays working).
  */
@@ -36,8 +32,8 @@
 
 void protocol_handle_client(int client_fd, user_db_t *user_db, message_db_t *msg_db);
 
-/* BIG v0.2 */
-enum { PROTO_V2 = 0x02 };
+/* BIG v0.3 */
+enum { PROTO_V3 = 0x03 };
 
 /* Type encoding:
    Type = (Resource << 3) | (Action << 1) | Direction
@@ -193,7 +189,7 @@ static int listen_tcp(const char *ip, int port) {
 
 static int send_pdu(int fd, uint8_t type, uint8_t status, const void *body, uint32_t blen) {
     WireHeader h;
-    h.version = PROTO_V2;
+    h.version = PROTO_V3;
     h.type = type;
     h.status = status;
     h.reserved = 0;
@@ -394,7 +390,7 @@ int main(int argc, char **argv) {
     pthread_mutex_unlock(&g_mgr_mu);
 
     send_server_reg(mgr_fd, reg_ip, server_id);
-    printf("Sent SERVER_REG_REQ to manager (ver=0x%02x reg_ip=%s id=%u)\n", PROTO_V2, REG_IP, server_id);
+    printf("Sent SERVER_REG_REQ to manager (ver=0x%02x reg_ip=%s id=%u)\n", PROTO_V3, REG_IP, server_id);
 
     /* 3) Start Manager reader thread */
     pthread_t mgr_tid;
@@ -473,6 +469,5 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* unreachable in current design */
     return 0;
 }
