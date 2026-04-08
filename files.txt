@@ -1,0 +1,2 @@
+server_app main.c protocol.c src/user_db.c src/message_db.c include/user_db.h include/message_db.h pthread gdbm_compat gdbm
+db_test src/db_test.c src/user_db.c src/message_db.c include/user_db.h include/message_db.h pthread gdbm_compat gdbm

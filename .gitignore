@@ -18,3 +18,4 @@ cmake-build-*/
 /build/
 */CMakeFiles/
 CMakeConfigureLog.yaml
+.flags/
