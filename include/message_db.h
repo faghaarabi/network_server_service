@@ -48,6 +48,11 @@ extern "C" {
                                 uint8_t **out_msg,
                                 uint16_t *out_msg_len);
 
+    mdb_status_t message_db_del(message_db_t *db,
+                                uint8_t channel_id,
+                                uint64_t timestamp,
+                                uint8_t sender_id);
+
     mdb_status_t message_db_load_channel(message_db_t *db,
                                          uint8_t channel_id,
                                          message_record_t **out_items,

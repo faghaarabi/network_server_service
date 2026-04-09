@@ -2,7 +2,6 @@
 // Created by Fereshteh on 4/2/26.
 //
 
-
 #include "message_db.h"
 
 #include <ndbm.h>
@@ -174,6 +173,32 @@ mdb_status_t message_db_get(message_db_t *db,
     }
 
     *out_msg_len = prefix.msg_len;
+    return MDB_OK;
+}
+
+mdb_status_t message_db_del(message_db_t *db,
+                            uint8_t channel_id,
+                            uint64_t timestamp,
+                            uint8_t sender_id) {
+    if (!db || !db->dbm) return MDB_ERR_INVALID;
+
+    message_key_t key_struct;
+    make_key(&key_struct, channel_id, timestamp, sender_id);
+
+    datum key;
+    key.dptr = (char *)&key_struct;
+    key.dsize = sizeof(key_struct);
+
+    datum value = dbm_fetch(db->dbm, key);
+    if (!value.dptr) {
+        return MDB_ERR_NOTFOUND;
+    }
+
+    int rc = dbm_delete(db->dbm, key);
+    if (rc != 0) {
+        return MDB_ERR_IO;
+    }
+
     return MDB_OK;
 }
 

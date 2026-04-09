@@ -45,7 +45,9 @@ enum {
     RES_LOG             = 0x03,
     RES_CHANNEL         = 0x04,
     RES_CHANNELS        = 0x05,
-    RES_MESSAGE         = 0x06
+    RES_MESSAGE         = 0x06,
+    RES_MESSAGES        = 0x07,
+    RES_USERS           = 0x08
 };
 
 enum { CRUD_CREATE = 0x00, CRUD_READ = 0x01, CRUD_UPDATE = 0x02, CRUD_DELETE = 0x03 };
@@ -68,7 +70,10 @@ enum MsgType {
     MSG_CHANNEL_DELETE_REQ  = 0x26, MSG_CHANNEL_DELETE_RES  = 0x27,
     MSG_CHANNELS_READ_REQ   = 0x2A, MSG_CHANNELS_READ_RES   = 0x2B,
     MSG_MESSAGE_CREATE_REQ  = 0x30, MSG_MESSAGE_CREATE_RES  = 0x31,
-    MSG_MESSAGE_READ_REQ    = 0x32, MSG_MESSAGE_READ_RES    = 0x33
+    MSG_MESSAGE_READ_REQ    = 0x32, MSG_MESSAGE_READ_RES    = 0x33,
+    MSG_MESSAGE_UPDATE_REQ  = 0x34, MSG_MESSAGE_UPDATE_RES  = 0x35,
+    MSG_MESSAGE_DELETE_REQ  = 0x36, MSG_MESSAGE_DELETE_RES  = 0x37,
+    MSG_USERS_READ_REQ      = 0x42, MSG_USERS_READ_RES      = 0x43
 };
 
 /* Compatibility aliases */
@@ -172,6 +177,30 @@ typedef struct {
     uint8_t channel_id;
     uint8_t sender_id;
 } BodyMessageReadPrefix;
+
+typedef struct {
+    uint8_t auth_username16[16];
+    uint8_t auth_password16[16];
+    uint64_t timestamp;
+    uint16_t message_len;
+    uint8_t channel_id;
+} BodyMessageUpdatePrefix;
+
+typedef struct {
+    uint8_t auth_username16[16];
+    uint8_t auth_password16[16];
+    uint64_t timestamp;
+    uint8_t channel_id;
+} BodyMessageDelete;
+
+typedef struct {
+    uint8_t auth_username16[16];
+    uint8_t auth_password16[16];
+    uint8_t result_len_limit;
+    uint8_t result_len;
+    uint8_t channel_id;
+    uint8_t flag;
+} BodyUsersReadPrefix;
 
 #pragma pack(pop)
 
@@ -413,7 +442,9 @@ static bool is_valid_type_combo(uint8_t type) {
         case RES_CHANNELS:
             return (a == CRUD_READ);
         case RES_MESSAGE:
-            return (a == CRUD_CREATE) || (a == CRUD_READ);
+            return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE) || (a == CRUD_DELETE);
+        case RES_USERS:
+            return (a == CRUD_READ);
         default:
             return false;
     }
@@ -1262,6 +1293,192 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
 
         int ret = send_response_raw(client_fd, MSG_MESSAGE_READ_RES, ST_OK, rbody, rlen);
         free(rbody);
+        return ret < 0 ? -1 : 1;
+    }
+
+    /* ================= MESSAGE UPDATE ================= */
+    if (h.type == MSG_MESSAGE_UPDATE_REQ) {
+        if (body_len < sizeof(BodyMessageUpdatePrefix)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        BodyMessageUpdatePrefix req;
+        memcpy(&req, body, sizeof(req));
+
+        uint16_t msg_len = ntohs(req.message_len);
+        if (body_len != (uint32_t)sizeof(BodyMessageUpdatePrefix) + msg_len) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InvalidCreds, NULL, 0);
+        }
+
+        uint8_t sender_uid = 0;
+        if (!uidmap_find_by_username(req.auth_username16, &sender_uid)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
+        }
+
+        uint64_t ts = my_ntohll(req.timestamp);
+        uint8_t dummy_uname[16];
+        uint8_t *old_msg = NULL;
+        uint16_t old_len = 0;
+
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t gst = message_db_get(msg_db, req.channel_id, ts, sender_uid, dummy_uname, &old_msg, &old_len);
+
+        if (gst == MDB_ERR_NOTFOUND) {
+            pthread_mutex_unlock(&g_msg_db_mu);
+            free(body);
+            printf("[MESSAGE UPDATE] Not found ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_NotFound, NULL, 0);
+        } else if (gst != MDB_OK) {
+            pthread_mutex_unlock(&g_msg_db_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
+        }
+        free(old_msg);
+
+        const uint8_t *msg_ptr = body + sizeof(BodyMessageUpdatePrefix);
+        uint16_t stored_len = (msg_len > MAX_STORED_MESSAGE) ? MAX_STORED_MESSAGE : msg_len;
+
+        mdb_status_t mst = message_db_put(msg_db, req.channel_id, ts, sender_uid, req.auth_username16, msg_ptr, stored_len, true);
+        pthread_mutex_unlock(&g_msg_db_mu);
+
+        if (mst != MDB_OK) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
+        }
+
+        printf("[MESSAGE UPDATE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+        int ret = send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_OK, body, body_len);
+        free(body);
+        return ret;
+    }
+
+    /* ================= MESSAGE DELETE ================= */
+    if (h.type == MSG_MESSAGE_DELETE_REQ) {
+        if (body_len != sizeof(BodyMessageDelete)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        BodyMessageDelete req;
+        memcpy(&req, body, sizeof(req));
+
+        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InvalidCreds, NULL, 0);
+        }
+
+        uint8_t sender_uid = 0;
+        if (!uidmap_find_by_username(req.auth_username16, &sender_uid)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InternalError, NULL, 0);
+        }
+
+        uint64_t ts = my_ntohll(req.timestamp);
+
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t dst = message_db_del(msg_db, req.channel_id, ts, sender_uid);
+        pthread_mutex_unlock(&g_msg_db_mu);
+
+        if (dst == MDB_ERR_NOTFOUND) {
+            free(body);
+            printf("[MESSAGE DELETE] Not found ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_NotFound, NULL, 0);
+        } else if (dst != MDB_OK) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InternalError, NULL, 0);
+        }
+
+        printf("[MESSAGE DELETE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+        int ret = send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_OK, body, body_len);
+        free(body);
+        return ret;
+    }
+
+    /* ================= USERS READ ================= */
+    if (h.type == MSG_USERS_READ_REQ) {
+        if (body_len < sizeof(BodyUsersReadPrefix)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_USERS_READ_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        BodyUsersReadPrefix req;
+        memcpy(&req, body, sizeof(req));
+
+        if (body_len != (uint32_t)sizeof(BodyUsersReadPrefix) + req.result_len) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_USERS_READ_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_USERS_READ_RES, ST_InvalidCreds, NULL, 0);
+        }
+
+        uint8_t out_users[255];
+        uint8_t count = 0;
+        uint8_t limit = req.result_len_limit;
+        bool filter_channel = (req.flag & 0x80) != 0;
+
+        pthread_mutex_lock(&g_uidmap_mu);
+        
+        if (filter_channel) {
+            pthread_mutex_lock(&g_channels_mu);
+            int ch_idx = -1;
+            for (int i = 0; i < MAX_CHANNELS; i++) {
+                if (g_channels[i].in_use && g_channels[i].channel_id == req.channel_id) {
+                    ch_idx = i;
+                    break;
+                }
+            }
+            
+            for (int i = 1; i < 256; i++) {
+                if (g_uid_present[i]) {
+                    if (ch_idx >= 0 && channel_has_member_locked(&g_channels[ch_idx], i)) {
+                        if (count < limit) out_users[count++] = i;
+                    }
+                }
+            }
+            pthread_mutex_unlock(&g_channels_mu);
+        } else {
+            for (int i = 1; i < 256; i++) {
+                if (g_uid_present[i]) {
+                    if (count < limit) out_users[count++] = i;
+                }
+            }
+        }
+        pthread_mutex_unlock(&g_uidmap_mu);
+
+        uint32_t resp_len = (uint32_t)sizeof(BodyUsersReadPrefix) + count;
+        uint8_t *resp = (uint8_t *)calloc(1, resp_len);
+        if (!resp) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_USERS_READ_RES, ST_ResourceExhausted, NULL, 0);
+        }
+
+        BodyUsersReadPrefix *prefix = (BodyUsersReadPrefix *)resp;
+        memcpy(prefix->auth_username16, req.auth_username16, 16);
+        memcpy(prefix->auth_password16, req.auth_password16, 16);
+        prefix->result_len_limit = req.result_len_limit;
+        prefix->result_len = count;
+        prefix->channel_id = req.channel_id;
+        prefix->flag = req.flag;
+
+        if (count > 0) {
+            memcpy(resp + sizeof(BodyUsersReadPrefix), out_users, count);
+        }
+
+        printf("[USERS READ] Success. filtered=%d, returned=%u users\n", filter_channel, count);
+        int ret = send_response_raw(client_fd, MSG_USERS_READ_RES, ST_OK, resp, resp_len);
+        free(resp);
+        free(body);
         return ret < 0 ? -1 : 1;
     }
 
