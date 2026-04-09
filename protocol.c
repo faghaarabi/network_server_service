@@ -73,6 +73,7 @@ enum MsgType {
     MSG_MESSAGE_READ_REQ    = 0x32, MSG_MESSAGE_READ_RES    = 0x33,
     MSG_MESSAGE_UPDATE_REQ  = 0x34, MSG_MESSAGE_UPDATE_RES  = 0x35,
     MSG_MESSAGE_DELETE_REQ  = 0x36, MSG_MESSAGE_DELETE_RES  = 0x37,
+    MSG_MESSAGES_READ_REQ   = 0x3A, MSG_MESSAGES_READ_RES   = 0x3B,
     MSG_USERS_READ_REQ      = 0x42, MSG_USERS_READ_RES      = 0x43
 };
 
@@ -192,6 +193,16 @@ typedef struct {
     uint64_t timestamp;
     uint8_t channel_id;
 } BodyMessageDelete;
+
+typedef struct {
+    uint8_t auth_username16[16];
+    uint8_t auth_password16[16];
+    uint64_t start_timestamp;
+    uint16_t result_len_limit;
+    uint16_t result_len;
+    uint8_t channel_id;
+    uint8_t reserved[3];
+} BodyMessagesReadPrefix;
 
 typedef struct {
     uint8_t auth_username16[16];
@@ -443,6 +454,8 @@ static bool is_valid_type_combo(uint8_t type) {
             return (a == CRUD_READ);
         case RES_MESSAGE:
             return (a == CRUD_CREATE) || (a == CRUD_READ) || (a == CRUD_UPDATE) || (a == CRUD_DELETE);
+        case RES_MESSAGES:
+            return (a == CRUD_READ);
         case RES_USERS:
             return (a == CRUD_READ);
         default:
@@ -525,9 +538,7 @@ static int send_response_keepalive(int fd, uint8_t type, uint8_t status, const v
     return (send_response_raw(fd, type, status, body, body_len) < 0) ? -1 : 1;
 }
 
-static uint8_t *build_message_read_body(const uint8_t auth_username16[16],
-                                        const uint8_t auth_password16[16],
-                                        uint64_t timestamp_host,
+static uint8_t *build_message_read_body(uint64_t timestamp_host,
                                         uint16_t msg_len_host,
                                         uint8_t channel_id,
                                         uint8_t sender_id,
@@ -538,8 +549,7 @@ static uint8_t *build_message_read_body(const uint8_t auth_username16[16],
     if (!buf) return NULL;
 
     BodyMessageReadPrefix *p = (BodyMessageReadPrefix *)buf;
-    memcpy(p->auth_username16, auth_username16, 16);
-    memcpy(p->auth_password16, auth_password16, 16);
+    /* Auth fields are zeroed safely by calloc as per RFC */
     p->timestamp = my_htonll(timestamp_host);
     p->message_len = htons(msg_len_host);
     p->channel_id = channel_id;
@@ -711,6 +721,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
             client_remove_fd(client_fd);
         }
 
+        memset(req.password16, 0, 16);
         return send_response_keepalive(client_fd, MSG_USER_UPDATE_RES, ST_OK, &req, sizeof(req));
     }
 
@@ -754,6 +765,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
 
         client_remove_fd(client_fd);
 
+        memset(req.password16, 0, 16);
         return send_response_keepalive(client_fd, MSG_USER_DELETE_RES, ST_OK, &req, sizeof(req));
     }
     
@@ -779,8 +791,6 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
 
         BodyUserRead res;
         memset(&res, 0, sizeof(res));
-        memcpy(res.auth_username16, req.auth_username16, 16);
-        memcpy(res.auth_password16, req.auth_password16, 16);
         memcpy(res.username16, uname16, 16);
         res.target_user_id = req.target_user_id;
 
@@ -842,6 +852,8 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         
         printf("[CHANNEL CREATE] Created channel '%s' (ID: %u)\n", req.channel_name16, req.channel_id);
         
+        memset(req.auth_username16, 0, 16);
+        memset(req.auth_password16, 0, 16);
         return send_response_keepalive(client_fd, MSG_CHANNEL_CREATE_RES, ST_OK, &req, sizeof(req));
     }
 
@@ -919,8 +931,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         BodyChannelReadPrefix *prefix = (BodyChannelReadPrefix *)resp;
-        memcpy(prefix->auth_username16, req.auth_username16, 16);
-        memcpy(prefix->auth_password16, req.auth_password16, 16);
+        // Auth is implicitly zeroed by calloc!
         memcpy(prefix->channel_name16, ch.channel_name16, 16);
         prefix->channel_id = ch.channel_id;
         prefix->user_id_len = ch.member_count;
@@ -931,50 +942,8 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
 
         int ret = send_response_raw(client_fd, MSG_CHANNEL_READ_RES, ST_OK, resp, resp_len);
         free(resp);
-        if (ret < 0) return -1;
-
-        message_record_t *items = NULL;
-        size_t item_count = 0;
-
-        pthread_mutex_lock(&g_msg_db_mu);
-        mdb_status_t lst = message_db_load_channel(msg_db, ch.channel_id, &items, &item_count);
-        pthread_mutex_unlock(&g_msg_db_mu);
-
-        if (lst == MDB_OK && item_count > 0) {
-            qsort(items, item_count, sizeof(message_record_t), compare_message_records);
-
-            for (size_t i = 0; i < item_count; i++) {
-                uint32_t hist_len = 0;
-                uint8_t *hist_body = build_message_read_body(
-                    req.auth_username16,
-                    req.auth_password16,
-                    items[i].timestamp,
-                    items[i].msg_len,
-                    ch.channel_id,
-                    items[i].sender_id,
-                    items[i].msg,
-                    &hist_len
-                );
-
-                if (!hist_body) {
-                    message_db_free_records(items, item_count);
-                    return send_response_keepalive(client_fd, MSG_MESSAGE_READ_RES, ST_ResourceExhausted, NULL, 0);
-                }
-
-                if (send_response_raw(client_fd, MSG_MESSAGE_READ_RES, ST_OK, hist_body, hist_len) < 0) {
-                    free(hist_body);
-                    message_db_free_records(items, item_count);
-                    return -1;
-                }
-
-                free(hist_body);
-            }
-        } else if (lst != MDB_OK && lst != MDB_ERR_NOTFOUND) {
-            return send_response_keepalive(client_fd, MSG_CHANNEL_READ_RES, ST_InternalError, NULL, 0);
-        }
-
-        message_db_free_records(items, item_count);
-        return 1;
+        
+        return ret < 0 ? -1 : 1;
     }
     
     /* ================= CHANNEL UPDATE ================= */
@@ -1033,6 +1002,9 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         
         printf("[CHANNEL UPDATE] Updated channel ID %u (New Name: '%s', Members: %u)\n", req.channel_id, req.channel_name16, count);
         
+        BodyChannelUpdatePrefix *p = (BodyChannelUpdatePrefix *)body;
+        memset(p->auth_username16, 0, 16);
+        memset(p->auth_password16, 0, 16);
         int ret = send_response_keepalive(client_fd, MSG_CHANNEL_UPDATE_RES, ST_OK, body, body_len);
         free(body);
         return ret;
@@ -1074,6 +1046,9 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         
         printf("[CHANNEL DELETE] Deleted channel ID %u\n", req.channel_id);
         
+        BodyChannelDelete *p = (BodyChannelDelete *)body;
+        memset(p->auth_username16, 0, 16);
+        memset(p->auth_password16, 0, 16);
         int ret = send_response_keepalive(client_fd, MSG_CHANNEL_DELETE_RES, ST_OK, body, body_len);
         free(body);
         return ret;
@@ -1111,8 +1086,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         BodyChannelsReadPrefix *prefix = (BodyChannelsReadPrefix *)resp;
-        memcpy(prefix->auth_username16, req.auth_username16, 16);
-        memcpy(prefix->auth_password16, req.auth_password16, 16);
+        // Auth is implicitly zeroed by calloc!
         prefix->channel_id_len = count;
         if (count > 0) memcpy(resp + sizeof(BodyChannelsReadPrefix), ids, count);
 
@@ -1197,12 +1171,13 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
             return send_response_keepalive(client_fd, MSG_MESSAGE_CREATE_RES, ST_InternalError, NULL, 0);
         }
 
+        BodyMessageCreateReqPrefix *p = (BodyMessageCreateReqPrefix *)body;
+        memset(p->auth_username16, 0, 16);
+        memset(p->auth_password16, 0, 16);
         int ack_ret = send_response_raw(client_fd, MSG_MESSAGE_CREATE_RES, ST_OK, body, body_len);
 
         uint32_t read_len = 0;
-        uint8_t *read_body = build_message_read_body(req.auth_username16,
-                                                     req.auth_password16,
-                                                     ts,
+        uint8_t *read_body = build_message_read_body(ts,
                                                      stored_len,
                                                      req.channel_id,
                                                      sender_uid,
@@ -1276,9 +1251,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         uint32_t rlen = 0;
-        uint8_t *rbody = build_message_read_body(req.auth_username16,
-                                                 req.auth_password16,
-                                                 target_ts,
+        uint8_t *rbody = build_message_read_body(target_ts,
                                                  msg_buf_len,
                                                  req.channel_id,
                                                  req.sender_id,
@@ -1355,6 +1328,10 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         printf("[MESSAGE UPDATE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+        
+        BodyMessageUpdatePrefix *p = (BodyMessageUpdatePrefix *)body;
+        memset(p->auth_username16, 0, 16);
+        memset(p->auth_password16, 0, 16);
         int ret = send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_OK, body, body_len);
         free(body);
         return ret;
@@ -1397,9 +1374,108 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         printf("[MESSAGE DELETE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+        
+        BodyMessageDelete *p = (BodyMessageDelete *)body;
+        memset(p->auth_username16, 0, 16);
+        memset(p->auth_password16, 0, 16);
         int ret = send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_OK, body, body_len);
         free(body);
         return ret;
+    }
+
+    /* ================= MESSAGES READ (History) ================= */
+    if (h.type == MSG_MESSAGES_READ_REQ) {
+        if (body_len < sizeof(BodyMessagesReadPrefix)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGES_READ_RES, ST_InvalidSize, NULL, 0);
+        }
+
+        BodyMessagesReadPrefix req;
+        memcpy(&req, body, sizeof(req));
+
+        if (!auth_ok16(db, req.auth_username16, req.auth_password16)) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGES_READ_RES, ST_InvalidCreds, NULL, 0);
+        }
+
+        uint64_t start_ts = my_ntohll(req.start_timestamp);
+        uint16_t limit = ntohs(req.result_len_limit);
+
+        message_record_t *items = NULL;
+        size_t count = 0;
+
+        pthread_mutex_lock(&g_msg_db_mu);
+        mdb_status_t lst = message_db_load_channel(msg_db, req.channel_id, &items, &count);
+        pthread_mutex_unlock(&g_msg_db_mu);
+
+        if (lst != MDB_OK && lst != MDB_ERR_NOTFOUND) {
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGES_READ_RES, ST_InternalError, NULL, 0);
+        }
+
+        if (lst == MDB_OK && count > 0) {
+            qsort(items, count, sizeof(message_record_t), compare_message_records);
+        }
+
+        uint16_t res_count = 0;
+        uint64_t *res_ts = NULL;
+        uint8_t *res_sid = NULL;
+
+        if (count > 0 && limit > 0) {
+            res_ts = (uint64_t *)malloc(limit * sizeof(uint64_t));
+            res_sid = (uint8_t *)malloc(limit * sizeof(uint8_t));
+            if (!res_ts || !res_sid) {
+                free(res_ts);
+                free(res_sid);
+                message_db_free_records(items, count);
+                free(body);
+                return send_response_keepalive(client_fd, MSG_MESSAGES_READ_RES, ST_ResourceExhausted, NULL, 0);
+            }
+
+            for (size_t i = 0; i < count; i++) {
+                if (items[i].timestamp >= start_ts) {
+                    if (res_count < limit) {
+                        res_ts[res_count] = my_htonll(items[i].timestamp);
+                        res_sid[res_count] = items[i].sender_id;
+                        res_count++;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        uint32_t resp_len = (uint32_t)sizeof(BodyMessagesReadPrefix) + (8 * res_count) + res_count;
+        uint8_t *resp = (uint8_t *)calloc(1, resp_len);
+        if (!resp) {
+            free(res_ts);
+            free(res_sid);
+            message_db_free_records(items, count);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGES_READ_RES, ST_ResourceExhausted, NULL, 0);
+        }
+
+        BodyMessagesReadPrefix *p = (BodyMessagesReadPrefix *)resp;
+        /* Auth and Reserved are implicitly zeroed by calloc! */
+        p->start_timestamp = req.start_timestamp;
+        p->result_len_limit = req.result_len_limit;
+        p->result_len = htons(res_count);
+        p->channel_id = req.channel_id;
+
+        if (res_count > 0) {
+            memcpy(resp + sizeof(BodyMessagesReadPrefix), res_ts, 8 * res_count);
+            memcpy(resp + sizeof(BodyMessagesReadPrefix) + (8 * res_count), res_sid, res_count);
+        }
+
+        int ret = send_response_raw(client_fd, MSG_MESSAGES_READ_RES, ST_OK, resp, resp_len);
+
+        free(res_ts);
+        free(res_sid);
+        free(resp);
+        message_db_free_records(items, count);
+        free(body);
+
+        return ret < 0 ? -1 : 1;
     }
 
     /* ================= USERS READ ================= */
@@ -1464,8 +1540,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         }
 
         BodyUsersReadPrefix *prefix = (BodyUsersReadPrefix *)resp;
-        memcpy(prefix->auth_username16, req.auth_username16, 16);
-        memcpy(prefix->auth_password16, req.auth_password16, 16);
+        // Auth is implicitly zeroed by calloc!
         prefix->result_len_limit = req.result_len_limit;
         prefix->result_len = count;
         prefix->channel_id = req.channel_id;
