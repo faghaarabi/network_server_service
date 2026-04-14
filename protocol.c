@@ -194,6 +194,7 @@ typedef struct {
     uint8_t channel_id;
 } BodyMessageDelete;
 
+#pragma pack(push, 1)
 typedef struct {
     uint8_t auth_username16[16];
     uint8_t auth_password16[16];
@@ -203,6 +204,7 @@ typedef struct {
     uint8_t channel_id;
     uint8_t reserved[3];
 } BodyMessagesReadPrefix;
+#pragma pack(pop)
 
 typedef struct {
     uint8_t auth_username16[16];
@@ -1269,7 +1271,7 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         return ret < 0 ? -1 : 1;
     }
 
-    /* ================= MESSAGE UPDATE ================= */
+        /* ================= MESSAGE UPDATE ================= */
     if (h.type == MSG_MESSAGE_UPDATE_REQ) {
         if (body_len < sizeof(BodyMessageUpdatePrefix)) {
             free(body);
@@ -1296,21 +1298,47 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
             return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
         }
 
+        pthread_mutex_lock(&g_channels_mu);
+
+        int ch_idx = -1;
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            if (g_channels[i].in_use && g_channels[i].channel_id == req.channel_id) {
+                ch_idx = i;
+                break;
+            }
+        }
+
+        if (ch_idx < 0) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_NotFound, NULL, 0);
+        }
+
+        if (!channel_has_member_locked(&g_channels[ch_idx], sender_uid)) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_NotChannelMember, NULL, 0);
+        }
+
         uint64_t ts = my_ntohll(req.timestamp);
         uint8_t dummy_uname[16];
         uint8_t *old_msg = NULL;
         uint16_t old_len = 0;
 
         pthread_mutex_lock(&g_msg_db_mu);
-        mdb_status_t gst = message_db_get(msg_db, req.channel_id, ts, sender_uid, dummy_uname, &old_msg, &old_len);
+        mdb_status_t gst = message_db_get(msg_db, req.channel_id, ts, sender_uid,
+                                          dummy_uname, &old_msg, &old_len);
 
         if (gst == MDB_ERR_NOTFOUND) {
             pthread_mutex_unlock(&g_msg_db_mu);
+            pthread_mutex_unlock(&g_channels_mu);
             free(body);
-            printf("[MESSAGE UPDATE] Not found ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+            printf("[MESSAGE UPDATE] Not found ch=%u ts=%llu sid=%u\n",
+                   req.channel_id, (unsigned long long)ts, sender_uid);
             return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_NotFound, NULL, 0);
         } else if (gst != MDB_OK) {
             pthread_mutex_unlock(&g_msg_db_mu);
+            pthread_mutex_unlock(&g_channels_mu);
             free(body);
             return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
         }
@@ -1319,25 +1347,54 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         const uint8_t *msg_ptr = body + sizeof(BodyMessageUpdatePrefix);
         uint16_t stored_len = (msg_len > MAX_STORED_MESSAGE) ? MAX_STORED_MESSAGE : msg_len;
 
-        mdb_status_t mst = message_db_put(msg_db, req.channel_id, ts, sender_uid, req.auth_username16, msg_ptr, stored_len, true);
+        mdb_status_t mst = message_db_put(msg_db, req.channel_id, ts, sender_uid,
+                                          req.auth_username16, msg_ptr, stored_len, true);
         pthread_mutex_unlock(&g_msg_db_mu);
 
         if (mst != MDB_OK) {
+            pthread_mutex_unlock(&g_channels_mu);
             free(body);
             return send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_InternalError, NULL, 0);
         }
 
-        printf("[MESSAGE UPDATE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
-        
+        printf("[MESSAGE UPDATE] Success ch=%u ts=%llu sid=%u\n",
+               req.channel_id, (unsigned long long)ts, sender_uid);
+
         BodyMessageUpdatePrefix *p = (BodyMessageUpdatePrefix *)body;
         memset(p->auth_username16, 0, 16);
         memset(p->auth_password16, 0, 16);
-        int ret = send_response_keepalive(client_fd, MSG_MESSAGE_UPDATE_RES, ST_OK, body, body_len);
+
+        int ack_ret = send_response_raw(client_fd, MSG_MESSAGE_UPDATE_RES, ST_OK, body, body_len);
+
+        uint32_t read_len = 0;
+        uint8_t *read_body = build_message_read_body(ts,
+                                                     stored_len,
+                                                     req.channel_id,
+                                                     sender_uid,
+                                                     msg_ptr,
+                                                     &read_len);
+
+        if (!read_body) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return ack_ret < 0 ? -1 : 1;
+        }
+
+        for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
+            uint8_t muid = g_channels[ch_idx].member_ids[i];
+            int mem_fd = client_get_fd(muid);
+            if (mem_fd >= 0) {
+                (void)send_response_raw(mem_fd, MSG_MESSAGE_READ_RES, ST_OK, read_body, read_len);
+            }
+        }
+
+        free(read_body);
+        pthread_mutex_unlock(&g_channels_mu);
         free(body);
-        return ret;
+        return ack_ret < 0 ? -1 : 1;
     }
 
-    /* ================= MESSAGE DELETE ================= */
+        /* ================= MESSAGE DELETE ================= */
     if (h.type == MSG_MESSAGE_DELETE_REQ) {
         if (body_len != sizeof(BodyMessageDelete)) {
             free(body);
@@ -1358,6 +1415,28 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
             return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InternalError, NULL, 0);
         }
 
+        pthread_mutex_lock(&g_channels_mu);
+
+        int ch_idx = -1;
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            if (g_channels[i].in_use && g_channels[i].channel_id == req.channel_id) {
+                ch_idx = i;
+                break;
+            }
+        }
+
+        if (ch_idx < 0) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_NotFound, NULL, 0);
+        }
+
+        if (!channel_has_member_locked(&g_channels[ch_idx], sender_uid)) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_NotChannelMember, NULL, 0);
+        }
+
         uint64_t ts = my_ntohll(req.timestamp);
 
         pthread_mutex_lock(&g_msg_db_mu);
@@ -1365,22 +1444,52 @@ int protocol_handle_one(int client_fd, user_db_t *db, message_db_t *msg_db) {
         pthread_mutex_unlock(&g_msg_db_mu);
 
         if (dst == MDB_ERR_NOTFOUND) {
+            pthread_mutex_unlock(&g_channels_mu);
             free(body);
-            printf("[MESSAGE DELETE] Not found ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
+            printf("[MESSAGE DELETE] Not found ch=%u ts=%llu sid=%u\n",
+                   req.channel_id, (unsigned long long)ts, sender_uid);
             return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_NotFound, NULL, 0);
         } else if (dst != MDB_OK) {
+            pthread_mutex_unlock(&g_channels_mu);
             free(body);
             return send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_InternalError, NULL, 0);
         }
 
-        printf("[MESSAGE DELETE] Success ch=%u ts=%llu sid=%u\n", req.channel_id, (unsigned long long)ts, sender_uid);
-        
+        printf("[MESSAGE DELETE] Success ch=%u ts=%llu sid=%u\n",
+               req.channel_id, (unsigned long long)ts, sender_uid);
+
         BodyMessageDelete *p = (BodyMessageDelete *)body;
         memset(p->auth_username16, 0, 16);
         memset(p->auth_password16, 0, 16);
-        int ret = send_response_keepalive(client_fd, MSG_MESSAGE_DELETE_RES, ST_OK, body, body_len);
+
+        int ack_ret = send_response_raw(client_fd, MSG_MESSAGE_DELETE_RES, ST_OK, body, body_len);
+
+        uint32_t read_len = 0;
+        uint8_t *read_body = build_message_read_body(ts,
+                                                     0,
+                                                     req.channel_id,
+                                                     sender_uid,
+                                                     NULL,
+                                                     &read_len);
+
+        if (!read_body) {
+            pthread_mutex_unlock(&g_channels_mu);
+            free(body);
+            return ack_ret < 0 ? -1 : 1;
+        }
+
+        for (int i = 0; i < g_channels[ch_idx].member_count; i++) {
+            uint8_t muid = g_channels[ch_idx].member_ids[i];
+            int mem_fd = client_get_fd(muid);
+            if (mem_fd >= 0) {
+                (void)send_response_raw(mem_fd, MSG_MESSAGE_READ_RES, ST_OK, read_body, read_len);
+            }
+        }
+
+        free(read_body);
+        pthread_mutex_unlock(&g_channels_mu);
         free(body);
-        return ret;
+        return ack_ret < 0 ? -1 : 1;
     }
 
     /* ================= MESSAGES READ (History) ================= */
