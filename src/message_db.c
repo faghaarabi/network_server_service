@@ -65,7 +65,7 @@ mdb_status_t message_db_open(message_db_t **out, const char *path) {
     message_db_t *db = (message_db_t *)calloc(1, sizeof(*db));
     if (!db) return MDB_ERR_IO;
 
-    db->dbm = dbm_open(path, O_RDWR | O_CREAT, 0666);
+    db->dbm = dbm_open((char *)path, O_RDWR | O_CREAT, 0666);
     if (!db->dbm) {
         free(db);
         return MDB_ERR_OPEN;
