@@ -10,20 +10,11 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 
 # --- OS-Specific Database Library Linking ---
 if(APPLE)
-    # Handle Apple Silicon (macOS ARM64) Homebrew Support
-    if(EXISTS "/opt/homebrew/include")
-        include_directories(/opt/homebrew/include)
-        link_directories(/opt/homebrew/lib)
-    endif()
-    
-    # Handle Intel Mac (macOS x86_64) Homebrew Support
-    if(EXISTS "/usr/local/include")
-        include_directories(/usr/local/include)
-        link_directories(/usr/local/lib)
-    endif()
-    
+    # Apple Silicon (macOS ARM64) Homebrew Support
+    include_directories(/opt/homebrew/include)
+    link_directories(/opt/homebrew/lib)
     set(DB_LIBS gdbm_compat gdbm)
-elseif(CMAKE_SYSTEM_NAME MATCHES "(?i)freebsd")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     # FreeBSD natively includes ndbm in libc; no extra links needed
     set(DB_LIBS "")
 else()
@@ -40,12 +31,8 @@ add_executable(server_app
 
 find_package(Threads REQUIRED)
 
-# Safely link the determined database libraries
-if(DB_LIBS)
-    target_link_libraries(server_app Threads::Threads ${DB_LIBS})
-else()
-    target_link_libraries(server_app Threads::Threads)
-endif()
+# Link the determined database libraries
+target_link_libraries(server_app Threads::Threads ${DB_LIBS})
 
 if (EXISTS "${CMAKE_SOURCE_DIR}/src/db_test.c")
   add_executable(db_test
@@ -53,10 +40,5 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/src/db_test.c")
     src/user_db.c
     src/message_db.c # <-- ADDED here as well
   )
-  
-  if(DB_LIBS)
-      target_link_libraries(db_test Threads::Threads ${DB_LIBS})
-  else()
-      target_link_libraries(db_test Threads::Threads)
-  endif()
+  target_link_libraries(db_test Threads::Threads ${DB_LIBS})
 endif()
